@@ -36,6 +36,36 @@ def compose_prompt(system_prompt, user_prompt, data):
     return "\n\n".join(parts)
 
 
+def strip_think_segments(text):
+    """Return text with <think> sections removed."""
+    if not text:
+        return ""
+
+    result = []
+    idx = 0
+    in_think = False
+
+    while idx < len(text):
+        if in_think:
+            close_idx = text.find("</think>", idx)
+            if close_idx == -1:
+                break
+            idx = close_idx + len("</think>")
+            in_think = False
+        else:
+            open_idx = text.find("<think>", idx)
+            if open_idx == -1:
+                result.append(text[idx:])
+                break
+
+            if open_idx > idx:
+                result.append(text[idx:open_idx])
+            idx = open_idx + len("<think>")
+            in_think = True
+
+    return "".join(result).strip()
+
+
 def colorize_response(text):
     """Return the response string with ANSI colors applied to think segments."""
     if not text:
@@ -75,6 +105,7 @@ def colorize_response(text):
 def print_stream_chunk(text, in_think):
     """Stream a chunk of text with think/final color separation."""
     idx = 0
+    final_parts = []
     while idx < len(text):
         if in_think:
             close_idx = text.find("</think>", idx)
@@ -96,15 +127,17 @@ def print_stream_chunk(text, in_think):
                 segment = text[idx:]
                 if segment:
                     print(f"{ANSWER_COLOR}{segment}{RESET}", end="", flush=True)
+                    final_parts.append(segment)
                 idx = len(text)
             else:
                 segment = text[idx:open_idx]
                 if segment:
                     print(f"{ANSWER_COLOR}{segment}{RESET}", end="", flush=True)
+                    final_parts.append(segment)
                 print(f"{YELLOW}<think>{RESET}", end="", flush=True)
                 idx = open_idx + len("<think>")
                 in_think = True
-    return in_think
+    return in_think, "".join(final_parts)
 
 def call_ollama_batch(api_url, model, prompt, temperature):
     """Send a prompt to Ollama API and return response text (batch mode)."""
@@ -129,10 +162,12 @@ def call_ollama_batch(api_url, model, prompt, temperature):
                     output.append(data.get("response", ""))
                 except Exception:
                     pass
-        return colorize_response("".join(output))
+        raw_text = "".join(output)
+        return colorize_response(raw_text), strip_think_segments(raw_text)
 
     except requests.RequestException as e:
-        return f"[Error contacting Ollama API: {e}]"
+        error_text = f"[Error contacting Ollama API: {e}]"
+        return error_text, ""
 
 
 def call_ollama_stream(api_url, model, prompt, temperature):
@@ -151,43 +186,68 @@ def call_ollama_stream(api_url, model, prompt, temperature):
         response.raise_for_status()
 
         in_think = False
+        final_parts = []
         for line in response.iter_lines():
             if line:
                 try:
                     data = json.loads(line.decode("utf-8"))
                     text = data.get("response", "")
                     if text:
-                        in_think = print_stream_chunk(text, in_think)
+                        in_think, segment = print_stream_chunk(text, in_think)
+                        if segment:
+                            final_parts.append(segment)
 
                     if data.get("done", False):
                         break
                 except Exception:
                     continue
         print()  # newline after generation
+        return strip_think_segments("".join(final_parts))
 
     except requests.RequestException as e:
         print(f"[Error contacting Ollama API: {e}]")
+        return ""
 
 
-def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prompt):
+def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prompt, memory_lines):
     """Interactive chat mode with selectable output mode."""
     print(f"Interactive mode with model '{model}' at {api_url}")
     print(f"Mode: {mode}, Temperature: {temperature}")
     print("Type 'exit' or Ctrl+C to quit.")
+    memory = []
     while True:
         try:
             prompt = input("You: ")
-            if prompt.strip().lower() in {"exit", "quit"}:
+            user_text = prompt.strip()
+            if user_text.lower() in {"exit", "quit"}:
                 break
-            final_prompt = compose_prompt(system_prompt, user_prompt, prompt)
+            history_text = "\n".join(memory) if memory_lines > 0 and memory else ""
+            conversation_parts = []
+            if history_text:
+                conversation_parts.append(history_text)
+            user_entry = user_text
+            if memory_lines > 0 and user_entry:
+                user_entry = f"User: {user_entry}"
+            conversation_parts.append(user_entry)
+            conversation_input = "\n".join(part for part in conversation_parts if part)
+            final_prompt = compose_prompt(system_prompt, user_prompt, conversation_input)
             if not final_prompt:
                 continue
+            final_text = ""
             if mode == "stream":
                 print("LLM (thinking): ", end="", flush=True)
-                call_ollama_stream(api_url, model, final_prompt, temperature)
+                final_text = call_ollama_stream(api_url, model, final_prompt, temperature)
             else:  # batch
-                response = call_ollama_batch(api_url, model, final_prompt, temperature)
+                response, final_text = call_ollama_batch(api_url, model, final_prompt, temperature)
                 print(response)
+
+            if memory_lines > 0:
+                if user_text:
+                    memory.append(f"User: {user_text}")
+                if final_text:
+                    memory.append(f"Assistant: {final_text.strip()}")
+                if memory_lines > 0 and len(memory) > memory_lines:
+                    memory[:] = memory[-memory_lines:]
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
             break
@@ -209,11 +269,14 @@ def main():
                         help="Path to a system prompt file (default: bsy-clippy.txt)")
     parser.add_argument("-u", "--user-prompt", default="",
                         help="Additional user instructions to prepend before the data")
+    parser.add_argument("-r", "--memory-lines", type=int, default=0,
+                        help="Remember this many lines of conversation in interactive mode")
 
     args = parser.parse_args()
     api_url = f"http://{args.ip}:{args.port}"
     system_prompt = load_system_prompt(args.system_file)
     user_prompt = args.user_prompt
+    memory_lines = max(0, args.memory_lines)
 
     # Detect mode if not specified
     mode = args.mode
@@ -228,17 +291,17 @@ def main():
         full_prompt = compose_prompt(system_prompt, user_prompt, data)
 
         if not full_prompt:
-            interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt)
+            interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt, memory_lines)
             return
 
         if mode == "stream":
             call_ollama_stream(api_url, args.model, full_prompt, args.temperature)
         else:
-            response = call_ollama_batch(api_url, args.model, full_prompt, args.temperature)
+            response, _ = call_ollama_batch(api_url, args.model, full_prompt, args.temperature)
             print(response)
         return
 
-    interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt)
+    interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt, memory_lines)
 
 
 if __name__ == "__main__":

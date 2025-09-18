@@ -24,6 +24,7 @@ You can also load **system prompts** from a file to guide the LLM’s behavior.
   - `-t` / `--temperature` → sampling temperature (default: `0.7`)
   - `-s` / `--system-file` → path to a text file with system instructions
   - `-u` / `--user-prompt` → extra user instructions prepended before the data payload
+  - `-r` / `--memory-lines` → number of conversation lines to remember in interactive mode
 - Two modes of operation:
   - **Batch mode** (default) → waits until the answer is complete, then prints only the final result.
   - **Stream mode** → shows response in real-time, tokens appear as they are generated.
@@ -71,6 +72,11 @@ user prompt text
 
 data from stdin or interactive input
 ```
+
+### Interactive memory
+
+Set `--memory-lines 6` (or `-r 6`) to keep the last six conversation lines (user + assistant) while chatting.  
+Only the final assistant reply (not the thinking traces) is stored and sent back on the next turn.
 
 ---
 
