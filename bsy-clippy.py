@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 import requests
 import json
@@ -209,7 +210,20 @@ def call_ollama_stream(api_url, model, prompt, temperature):
         return ""
 
 
-def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prompt, memory_lines, memory_seed=None):
+def read_user_input(prompt_text, input_stream):
+    """Read a line of input, supporting non-tty streams."""
+    if input_stream is None:
+        return input(prompt_text)
+
+    print(prompt_text, end="", flush=True)
+    line = input_stream.readline()
+    if not line:
+        raise EOFError
+    return line.rstrip("\r\n")
+
+
+def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prompt,
+                     memory_lines, memory_seed=None, input_stream=None):
     """Interactive chat mode with selectable output mode."""
     print(f"Interactive mode with model '{model}' at {api_url}")
     print(f"Mode: {mode}, Temperature: {temperature}")
@@ -217,9 +231,39 @@ def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prom
     memory = list(memory_seed) if memory_seed else []
     if memory_lines > 0 and memory:
         memory[:] = memory[-memory_lines:]
-    while True:
-        try:
-            prompt = input("You: ")
+    local_stream = input_stream
+    close_stream = False
+    if local_stream is None:
+        if sys.stdin.isatty():
+            local_stream = None
+        else:
+            tty_paths = ["CONIN$"] if os.name == "nt" else ["/dev/tty"]
+            for path in tty_paths:
+                try:
+                    local_stream = open(path, "r", encoding="utf-8", errors="ignore")
+                    close_stream = True
+                    break
+                except OSError:
+                    local_stream = None
+            if local_stream is None and sys.stdin.isatty():
+                local_stream = None
+            elif local_stream is None:
+                local_stream = sys.stdin
+
+    try:
+        while True:
+            try:
+                prompt = read_user_input("You: ", local_stream)
+            except EOFError:
+                if local_stream is sys.stdin and not sys.stdin.isatty():
+                    print("\n[Warning] No interactive input available; exiting.")
+                else:
+                    print("\nExiting.")
+                break
+            except KeyboardInterrupt:
+                print("\nExiting.")
+                break
+
             user_text = prompt.strip()
             if user_text.lower() in {"exit", "quit"}:
                 break
@@ -248,11 +292,14 @@ def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prom
                     memory.append(f"User: {user_text}")
                 if final_text:
                     memory.append(f"Assistant: {final_text.strip()}")
-                if memory_lines > 0 and len(memory) > memory_lines:
+                if len(memory) > memory_lines:
                     memory[:] = memory[-memory_lines:]
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting.")
-            break
+    finally:
+        if close_stream and local_stream not in {None, sys.stdin}:
+            try:
+                local_stream.close()
+            except OSError:
+                pass
 
 
 def main():
