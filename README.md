@@ -25,6 +25,7 @@ You can also load **system prompts** from a file to guide the LLM’s behavior.
   - `-s` / `--system-file` → path to a text file with system instructions
   - `-u` / `--user-prompt` → extra user instructions prepended before the data payload
   - `-r` / `--memory-lines` → number of conversation lines to remember in interactive mode
+  - `-c` / `--chat-after-stdin` → process stdin once, then drop into interactive chat
 - Two modes of operation:
   - **Batch mode** (default) → waits until the answer is complete, then prints only the final result.
   - **Stream mode** → shows response in real-time, tokens appear as they are generated.
@@ -77,6 +78,16 @@ data from stdin or interactive input
 
 Set `--memory-lines 6` (or `-r 6`) to keep the last six conversation lines (user + assistant) while chatting.  
 Only the final assistant reply (not the thinking traces) is stored and sent back on the next turn.
+
+### Chat after stdin
+
+Use `-c` / `--chat-after-stdin` to process piped data first and then remain in interactive mode with the response (and any configured memory) available:
+
+```bash
+cat sample.txt | python bsy-clippy.py -u "Summarize this report" -r 6 -c
+```
+
+After the initial answer prints, you can continue the conversation while the tool remembers the piped data and the model’s reply.
 
 ---
 

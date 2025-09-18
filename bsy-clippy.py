@@ -209,19 +209,21 @@ def call_ollama_stream(api_url, model, prompt, temperature):
         return ""
 
 
-def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prompt, memory_lines):
+def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prompt, memory_lines, memory_seed=None):
     """Interactive chat mode with selectable output mode."""
     print(f"Interactive mode with model '{model}' at {api_url}")
     print(f"Mode: {mode}, Temperature: {temperature}")
     print("Type 'exit' or Ctrl+C to quit.")
-    memory = []
+    memory = list(memory_seed) if memory_seed else []
+    if memory_lines > 0 and memory:
+        memory[:] = memory[-memory_lines:]
     while True:
         try:
             prompt = input("You: ")
             user_text = prompt.strip()
             if user_text.lower() in {"exit", "quit"}:
                 break
-            history_text = "\n".join(memory) if memory_lines > 0 and memory else ""
+            history_text = "\n".join(memory) if memory else ""
             conversation_parts = []
             if history_text:
                 conversation_parts.append(history_text)
@@ -271,12 +273,15 @@ def main():
                         help="Additional user instructions to prepend before the data")
     parser.add_argument("-r", "--memory-lines", type=int, default=0,
                         help="Remember this many lines of conversation in interactive mode")
+    parser.add_argument("-c", "--chat-after-stdin", action="store_true",
+                        help="After processing stdin, continue in interactive chat mode")
 
     args = parser.parse_args()
     api_url = f"http://{args.ip}:{args.port}"
     system_prompt = load_system_prompt(args.system_file)
     user_prompt = args.user_prompt
     memory_lines = max(0, args.memory_lines)
+    chat_after_stdin = args.chat_after_stdin
 
     # Detect mode if not specified
     mode = args.mode
@@ -294,11 +299,32 @@ def main():
             interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt, memory_lines)
             return
 
+        memory_seed = []
+        data_text = data.strip()
+        if data_text:
+            memory_seed.append(f"User: {data_text}")
+
+        final_text = ""
         if mode == "stream":
-            call_ollama_stream(api_url, args.model, full_prompt, args.temperature)
+            final_text = call_ollama_stream(api_url, args.model, full_prompt, args.temperature)
         else:
-            response, _ = call_ollama_batch(api_url, args.model, full_prompt, args.temperature)
+            response, final_text = call_ollama_batch(api_url, args.model, full_prompt, args.temperature)
             print(response)
+        if chat_after_stdin:
+            if final_text:
+                memory_seed.append(f"Assistant: {final_text.strip()}")
+            if memory_lines > 0 and memory_seed:
+                memory_seed = memory_seed[-memory_lines:]
+            interactive_mode(
+                api_url,
+                args.model,
+                mode,
+                args.temperature,
+                system_prompt,
+                user_prompt,
+                memory_lines,
+                memory_seed if memory_seed else None,
+            )
         return
 
     interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt, memory_lines)
