@@ -23,6 +23,7 @@ You can also load **system prompts** from a file to guide the LLM’s behavior.
   - `--mode` → output mode (`stream` or `batch`)
   - `--temperature` → sampling temperature (default: `0.7`)
   - `--system-file` → path to a text file with system instructions
+  - `--user-prompt` → extra user instructions prepended before the data payload
 - Two modes of operation:
   - **Batch mode** (default) → waits until the answer is complete, then prints only the final result.
   - **Stream mode** → shows response in real-time, tokens appear as they are generated.
@@ -58,6 +59,18 @@ Always explain your reasoning clearly, and avoid unnecessary markdown formatting
 ```
 
 These lines will be sent to the LLM before every user prompt.
+
+### User prompt parameter
+
+Use `--user-prompt "Classify the following log:"` when piping data so the model receives:
+
+```
+system prompt (if any)
+
+user prompt text
+
+data from stdin or interactive input
+```
 
 ---
 
