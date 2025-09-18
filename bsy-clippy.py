@@ -7,6 +7,7 @@ from pathlib import Path
 
 # ANSI colors
 YELLOW = "\033[93m"
+ANSWER_COLOR = "\033[96m"
 RESET = "\033[0m"
 
 
@@ -34,6 +35,77 @@ def compose_prompt(system_prompt, user_prompt, data):
             parts.append(part.strip("\n"))
     return "\n\n".join(parts)
 
+
+def colorize_response(text):
+    """Return the response string with ANSI colors applied to think segments."""
+    if not text:
+        return ""
+
+    idx = 0
+    in_think = False
+    output = []
+
+    while idx < len(text):
+        if in_think:
+            close_idx = text.find("</think>", idx)
+            if close_idx == -1:
+                output.append(f"{YELLOW}{text[idx:]}{RESET}")
+                break
+
+            if close_idx > idx:
+                output.append(f"{YELLOW}{text[idx:close_idx]}{RESET}")
+            output.append(f"{YELLOW}</think>{RESET}")
+            idx = close_idx + len("</think>")
+            in_think = False
+        else:
+            open_idx = text.find("<think>", idx)
+            if open_idx == -1:
+                output.append(f"{ANSWER_COLOR}{text[idx:]}{RESET}")
+                break
+
+            if open_idx > idx:
+                output.append(f"{ANSWER_COLOR}{text[idx:open_idx]}{RESET}")
+            output.append(f"{YELLOW}<think>{RESET}")
+            idx = open_idx + len("<think>")
+            in_think = True
+
+    return "".join(output)
+
+
+def print_stream_chunk(text, in_think):
+    """Stream a chunk of text with think/final color separation."""
+    idx = 0
+    while idx < len(text):
+        if in_think:
+            close_idx = text.find("</think>", idx)
+            if close_idx == -1:
+                segment = text[idx:]
+                if segment:
+                    print(f"{YELLOW}{segment}{RESET}", end="", flush=True)
+                idx = len(text)
+            else:
+                segment = text[idx:close_idx]
+                if segment:
+                    print(f"{YELLOW}{segment}{RESET}", end="", flush=True)
+                print(f"{YELLOW}</think>{RESET}", end="", flush=True)
+                idx = close_idx + len("</think>")
+                in_think = False
+        else:
+            open_idx = text.find("<think>", idx)
+            if open_idx == -1:
+                segment = text[idx:]
+                if segment:
+                    print(f"{ANSWER_COLOR}{segment}{RESET}", end="", flush=True)
+                idx = len(text)
+            else:
+                segment = text[idx:open_idx]
+                if segment:
+                    print(f"{ANSWER_COLOR}{segment}{RESET}", end="", flush=True)
+                print(f"{YELLOW}<think>{RESET}", end="", flush=True)
+                idx = open_idx + len("<think>")
+                in_think = True
+    return in_think
+
 def call_ollama_batch(api_url, model, prompt, temperature):
     """Send a prompt to Ollama API and return response text (batch mode)."""
     try:
@@ -57,7 +129,7 @@ def call_ollama_batch(api_url, model, prompt, temperature):
                     output.append(data.get("response", ""))
                 except Exception:
                     pass
-        return "".join(output)
+        return colorize_response("".join(output))
 
     except requests.RequestException as e:
         return f"[Error contacting Ollama API: {e}]"
@@ -85,19 +157,7 @@ def call_ollama_stream(api_url, model, prompt, temperature):
                     data = json.loads(line.decode("utf-8"))
                     text = data.get("response", "")
                     if text:
-                        # Detect <think> start
-                        if "<think>" in text:
-                            in_think = True
-                        # Detect </think> end
-                        if "</think>" in text:
-                            in_think = False
-                            print(f"{YELLOW}{text}{RESET}", end="", flush=True)
-                            continue
-
-                        if in_think:
-                            print(f"{YELLOW}{text}{RESET}", end="", flush=True)
-                        else:
-                            print(f"{text}", end="", flush=True)
+                        in_think = print_stream_chunk(text, in_think)
 
                     if data.get("done", False):
                         break
