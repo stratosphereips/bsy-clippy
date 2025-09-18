@@ -17,13 +17,13 @@ You can also load **system prompts** from a file to guide the LLM’s behavior.
   - Mode: `batch` (wait for full output)
   - System prompt file: `bsy-clippy.txt`
 - Configurable parameters:
-  - `--ip` → Ollama server IP
-  - `--port` → Ollama server port
-  - `--model` → model name
-  - `--mode` → output mode (`stream` or `batch`)
-  - `--temperature` → sampling temperature (default: `0.7`)
-  - `--system-file` → path to a text file with system instructions
-  - `--user-prompt` → extra user instructions prepended before the data payload
+  - `-i` / `--ip` → Ollama server IP
+  - `-p` / `--port` → Ollama server port
+  - `-M` / `--model` → model name
+  - `-m` / `--mode` → output mode (`stream` or `batch`)
+  - `-t` / `--temperature` → sampling temperature (default: `0.7`)
+  - `-s` / `--system-file` → path to a text file with system instructions
+  - `-u` / `--user-prompt` → extra user instructions prepended before the data payload
 - Two modes of operation:
   - **Batch mode** (default) → waits until the answer is complete, then prints only the final result.
   - **Stream mode** → shows response in real-time, tokens appear as they are generated.

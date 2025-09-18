@@ -195,16 +195,19 @@ def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prom
 
 def main():
     parser = argparse.ArgumentParser(description="bsy-clippy: Ollama API Client")
-    parser.add_argument("--ip", default="172.20.0.100", help="Ollama server IP (default: 172.20.0.100)")
-    parser.add_argument("--port", default="11434", help="Ollama server port (default: 11434)")
-    parser.add_argument("--model", default="qwen3:1.7b", help="Model name (default: qwen3:1.7b)")
-    parser.add_argument("--mode", choices=["stream", "batch"], default="stream",
+    parser.add_argument("-i", "--ip", default="172.20.0.100",
+                        help="Ollama server IP (default: 172.20.0.100)")
+    parser.add_argument("-p", "--port", default="11434",
+                        help="Ollama server port (default: 11434)")
+    parser.add_argument("-M", "--model", default="qwen3:1.7b",
+                        help="Model name (default: qwen3:1.7b)")
+    parser.add_argument("-m", "--mode", choices=["stream", "batch"], default="stream",
                         help="Output mode: 'stream' = real-time, 'batch' = wait for final output")
-    parser.add_argument("--temperature", type=float, default=0.7,
+    parser.add_argument("-t", "--temperature", type=float, default=0.7,
                         help="Sampling temperature (default: 0.7, higher = more random)")
-    parser.add_argument("--system-file", default="bsy-clippy.txt",
+    parser.add_argument("-s", "--system-file", default="bsy-clippy.txt",
                         help="Path to a system prompt file (default: bsy-clippy.txt)")
-    parser.add_argument("--user-prompt", default="",
+    parser.add_argument("-u", "--user-prompt", default="",
                         help="Additional user instructions to prepend before the data")
 
     args = parser.parse_args()
