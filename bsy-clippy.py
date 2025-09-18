@@ -109,7 +109,7 @@ def main():
     parser.add_argument("--ip", default="172.20.0.100", help="Ollama server IP (default: 172.20.0.100)")
     parser.add_argument("--port", default="11434", help="Ollama server port (default: 11434)")
     parser.add_argument("--model", default="qwen3:1.7b", help="Model name (default: qwen3:1.7b)")
-    parser.add_argument("--mode", choices=["stream", "batch"], default=None,
+    parser.add_argument("--mode", choices=["stream", "batch"], default=stream,
                         help="Output mode: 'stream' = real-time, 'batch' = wait for final output")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Sampling temperature (default: 0.7, higher = more random)")
