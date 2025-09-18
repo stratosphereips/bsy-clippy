@@ -3,10 +3,36 @@ import argparse
 import sys
 import requests
 import json
+from pathlib import Path
 
 # ANSI colors
 YELLOW = "\033[93m"
 RESET = "\033[0m"
+
+
+def load_system_prompt(path):
+    """Return the content of a system prompt file if it exists."""
+    if not path:
+        return ""
+
+    file_path = Path(path)
+    if not file_path.exists():
+        return ""
+
+    try:
+        return file_path.read_text(encoding="utf-8").strip("\n")
+    except OSError as exc:
+        print(f"[Warning] Could not read system prompt file '{path}': {exc}", file=sys.stderr)
+        return ""
+
+
+def compose_prompt(system_prompt, user_prompt, data):
+    """Combine system prompt, user prompt, and data into a single message."""
+    parts = []
+    for part in (system_prompt, user_prompt, data):
+        if part and part.strip():
+            parts.append(part.strip("\n"))
+    return "\n\n".join(parts)
 
 def call_ollama_batch(api_url, model, prompt, temperature):
     """Send a prompt to Ollama API and return response text (batch mode)."""
@@ -83,7 +109,7 @@ def call_ollama_stream(api_url, model, prompt, temperature):
         print(f"[Error contacting Ollama API: {e}]")
 
 
-def interactive_mode(api_url, model, mode, temperature):
+def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prompt):
     """Interactive chat mode with selectable output mode."""
     print(f"Interactive mode with model '{model}' at {api_url}")
     print(f"Mode: {mode}, Temperature: {temperature}")
@@ -93,11 +119,14 @@ def interactive_mode(api_url, model, mode, temperature):
             prompt = input("You: ")
             if prompt.strip().lower() in {"exit", "quit"}:
                 break
+            final_prompt = compose_prompt(system_prompt, user_prompt, prompt)
+            if not final_prompt:
+                continue
             if mode == "stream":
                 print("LLM (thinking): ", end="", flush=True)
-                call_ollama_stream(api_url, model, prompt, temperature)
+                call_ollama_stream(api_url, model, final_prompt, temperature)
             else:  # batch
-                response = call_ollama_batch(api_url, model, prompt, temperature)
+                response = call_ollama_batch(api_url, model, final_prompt, temperature)
                 print(response)
         except (KeyboardInterrupt, EOFError):
             print("\nExiting.")
@@ -109,13 +138,19 @@ def main():
     parser.add_argument("--ip", default="172.20.0.100", help="Ollama server IP (default: 172.20.0.100)")
     parser.add_argument("--port", default="11434", help="Ollama server port (default: 11434)")
     parser.add_argument("--model", default="qwen3:1.7b", help="Model name (default: qwen3:1.7b)")
-    parser.add_argument("--mode", choices=["stream", "batch"], default='stream',
+    parser.add_argument("--mode", choices=["stream", "batch"], default=None,
                         help="Output mode: 'stream' = real-time, 'batch' = wait for final output")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Sampling temperature (default: 0.7, higher = more random)")
+    parser.add_argument("--system-file", default="bsy-clippy.txt",
+                        help="Path to a system prompt file (default: bsy-clippy.txt)")
+    parser.add_argument("--user-prompt", default="",
+                        help="Additional user instructions to prepend before the data")
 
     args = parser.parse_args()
     api_url = f"http://{args.ip}:{args.port}"
+    system_prompt = load_system_prompt(args.system_file)
+    user_prompt = args.user_prompt
 
     # Detect mode if not specified
     mode = args.mode
@@ -125,20 +160,22 @@ def main():
         else:
             mode = "stream"  # interactive defaults to stream
 
-    if not sys.stdin.isatty() and args.mode is None:  # stdin input, no override
-        prompt = sys.stdin.read().strip()
-        if prompt:
-            response = call_ollama_batch(api_url, args.model, prompt, args.temperature)
-            print(response)
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        full_prompt = compose_prompt(system_prompt, user_prompt, data)
+
+        if not full_prompt:
+            interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt)
+            return
+
+        if mode == "stream":
+            call_ollama_stream(api_url, args.model, full_prompt, args.temperature)
         else:
-            interactive_mode(api_url, args.model, mode, args.temperature)
-    elif not sys.stdin.isatty() and args.mode == "stream":
-        # stdin but user forces streaming
-        prompt = sys.stdin.read().strip()
-        if prompt:
-            call_ollama_stream(api_url, args.model, prompt, args.temperature)
-    else:
-        interactive_mode(api_url, args.model, mode, args.temperature)
+            response = call_ollama_batch(api_url, args.model, full_prompt, args.temperature)
+            print(response)
+        return
+
+    interactive_mode(api_url, args.model, mode, args.temperature, system_prompt, user_prompt)
 
 
 if __name__ == "__main__":
