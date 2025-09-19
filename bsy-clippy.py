@@ -267,15 +267,16 @@ def interactive_mode(api_url, model, mode, temperature, system_prompt, user_prom
             user_text = prompt.strip()
             if user_text.lower() in {"exit", "quit"}:
                 break
-            history_text = "\n".join(memory) if memory else ""
-            conversation_parts = []
-            if history_text:
-                conversation_parts.append(history_text)
-            user_entry = user_text
-            if memory_lines > 0 and user_entry:
-                user_entry = f"User: {user_entry}"
-            conversation_parts.append(user_entry)
-            conversation_input = "\n".join(part for part in conversation_parts if part)
+            history_block = ""
+            if memory:
+                history_block = "History of Past Interaction:\n" + "\n".join(memory)
+
+            current_block = ""
+            if user_text:
+                current_block = f"Current User Message:\n{user_text}"
+
+            conversation_parts = [part for part in (history_block, current_block) if part]
+            conversation_input = "\n\n".join(conversation_parts)
             final_prompt = compose_prompt(system_prompt, user_prompt, conversation_input)
             if not final_prompt:
                 continue
