@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bsy-clippy"
+version = "0.2.0"
+description = "Terminal client for OpenAI chat completions"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Sebastian Garcia" }
+]
+dependencies = [
+    "openai>=1.16.0",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+"bsy-clippy" = "bsy_clippy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"bsy_clippy" = ["data/*.txt"]
