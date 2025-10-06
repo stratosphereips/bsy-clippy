@@ -9,25 +9,22 @@ You can also load **system prompts** from a file to guide the LLM’s behavior.
 
 ## Features
 
-- Speaks to the OpenAI Chat Completions API (or any compatible base URL).
-- Loads credentials from `.env` (`OPENAI_API_KEY`) using `python-dotenv`.
-- Reads defaults (profile, base URL, IP/port overrides, model) from `bsy-clippy.yaml`.
-- Toggle endpoints by editing `api.profile` in `bsy-clippy.yaml` or passing `--profile` on the CLI.
+- Speaks to the OpenAI Chat Completions API or any OpenAI-compatible deployment.
+- Loads credentials from `.env` (`OPENAI_API_KEY`) via `python-dotenv` when the selected profile requires them.
+- Reads defaults (profile, provider, base URL, model) from `bsy-clippy.yaml` and falls back to a packaged sample if none is found.
+- Switch profiles by editing `api.profile` or passing `--profile` (e.g. `--profile openai`) on the CLI.
 - Defaults to:
-  - Base URL: `http://172.20.0.100:11434/v1` (profile `ollama`)
+  - Provider: `ollama`
+  - Base URL: `http://172.20.0.100:11434`
   - Model: `qwen3:1.7b`
   - Mode: `stream` (see `--mode` to switch)
   - Bundled system prompt file that can be overridden with `--system-file`
 - Configurable parameters:
-  - `-b` / `--base-url` → explicit API endpoint
-  - `-i` / `--ip` and `-p` / `--port` → override host/port when targeting compatible servers
-  - `-M` / `--model` → model name
-  - `-m` / `--mode` → output mode (`stream` or `batch`)
-  - `-t` / `--temperature` → sampling temperature (default: `0.7`)
-  - `-s` / `--system-file` → path to a text file with system instructions
-  - `-u` / `--user-prompt` → extra user instructions prepended before the data payload
-  - `-r` / `--memory-lines` → number of conversation lines to remember in interactive mode
-  - `-c` / `--chat-after-stdin` → process stdin once, then drop into interactive chat
+  - `--config` / `--profile` → select a profile file and profile name
+  - `-b` / `--base-url`, `-i` / `--ip`, `-p` / `--port` → override connection details per run
+  - `-M` / `--model`, `-t` / `--temperature`, `-m` / `--mode` → tuning controls
+  - `-s` / `--system-file`, `-u` / `--user-prompt` → additional prompting knobs
+  - `-r` / `--memory-lines`, `-c` / `--chat-after-stdin` → conversation persistence options
 - Two modes of operation:
   - **Batch mode** → waits until the answer is complete, then prints only the final result.
   - **Stream mode** (default) → shows response in real-time, tokens appear as they are generated.
@@ -65,25 +62,48 @@ Create a `.env` file next to where you run `bsy-clippy` and add your key:
 OPENAI_API_KEY=sk-...
 ```
 
-The CLI loads this automatically via `python-dotenv`; environment variables from your shell work too.
+The CLI loads this automatically via `python-dotenv`; environment variables from your shell work too. Only the `openai` profile requires this token — `ollama` profiles can leave it unset.
 
 ### YAML defaults (`bsy-clippy.yaml`)
 
-`bsy-clippy.yaml` selects which profile to use and what settings belong to it. The packaged example ships with an Ollama profile enabled and an OpenAI profile commented out for reference:
+`bsy-clippy.yaml` selects which profile to use and what settings belong to it. The CLI looks for this file in the current working directory, then in `~/.config/bsy-clippy/`, and finally falls back to the bundled sample. Copy the sample to your project or config directory, edit it, and switch profiles as needed:
 
 ```
 api:
   profile: ollama
   profiles:
     ollama:
-      base_url: http://172.20.0.100:11434/v1
+      provider: ollama
+      base_url: http://172.20.0.100:11434
       model: qwen3:1.7b
     # openai:
+    #   provider: openai
     #   base_url: https://api.openai.com/v1
     #   model: gpt-4o-mini
+    #   api_key_env: OPENAI_API_KEY
 ```
 
-Change `profile` (or pass `--profile openai`) to switch endpoints, or add more entries under `profiles` for additional deployments.
+#### Switching profiles
+
+- Keep `profile: ollama` (the default) to talk to an Ollama server; no API token is required. Adjust `base_url` if your host or port differs.
+- To use OpenAI, either set `profile: openai` in the file or pass `--profile openai` on the command line. Make sure the `OPENAI_API_KEY` environment variable (or the name set in `api_key_env`) is populated before running the command.
+- You can define additional profiles (for example, staging clusters) under `api.profiles` and select them with `--profile <name>`.
+
+### Quick check
+
+```bash
+pip install -r requirements.txt          # or pipx install .
+cp src/bsy_clippy/data/bsy-clippy.yaml ./bsy-clippy.yaml
+python bsy-clippy.py --help              # confirms dependencies are in place
+```
+
+After copying the sample config you can edit it in-place and re-run `bsy-clippy` to target a different profile.
+If you installed via `pipx` or `pip`, copy the bundled sample with:
+
+```bash
+python -c "import importlib.resources as r, pathlib; pathlib.Path('bsy-clippy.yaml').write_text(r.files('bsy_clippy').joinpath('data/bsy-clippy.yaml').read_text())"
+```
+
 
 ## Usage
 
@@ -200,7 +220,7 @@ bsy-clippy --temperature 1.2
 ### Custom server and model
 
 ```bash
-bsy-clippy --base-url http://127.0.0.1:11434/v1 --model llama2
+bsy-clippy --profile ollama --base-url http://127.0.0.1:11434 --model llama2
 ```
 
 ---
