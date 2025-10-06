@@ -1,60 +1,64 @@
-"""Command-line interface for the bsy-clippy OpenAI client."""
+"""Command-line interface for the bsy-clippy client."""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from importlib import resources
 from pathlib import Path
-from typing import IO, Dict, List, Optional, Sequence, Tuple, Union
+from typing import IO, Dict, List, Optional, Sequence, Tuple
 
+import requests
 import yaml
-from dotenv import load_dotenv
+from dotenv import dotenv_values, find_dotenv
 from openai import OpenAI, OpenAIError
 
 YELLOW = "\033[93m"
 ANSWER_COLOR = "\033[96m"
 RESET = "\033[0m"
 
-_DEFAULT_SYSTEM_PROMPT = "data/bsy-clippy.txt"
-_DEFAULT_CONFIG = "bsy-clippy.yaml"
-_DEFAULT_BASE_URL = "https://api.openai.com/v1"
-_DEFAULT_MODEL = "gpt-4o-mini"
+_DEFAULT_SYSTEM_PROMPT_RESOURCE = "data/bsy-clippy.txt"
+_DEFAULT_CONFIG_FILENAME = "bsy-clippy.yaml"
+_DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
-
-def _read_default_system_prompt() -> str:
-    """Return the packaged default system prompt if it exists."""
+def _read_text_resource(relative_path: str) -> str:
     try:
-        prompt_path = resources.files("bsy_clippy").joinpath(_DEFAULT_SYSTEM_PROMPT)
-    except (FileNotFoundError, ModuleNotFoundError, AttributeError):
+        return resources.files("bsy_clippy").joinpath(relative_path).read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, AttributeError, OSError):
         return ""
 
-    try:
-        return prompt_path.read_text(encoding="utf-8").strip("\n")
-    except OSError:
-        return ""
+
+def _load_default_system_prompt() -> str:
+    return _read_text_resource(_DEFAULT_SYSTEM_PROMPT_RESOURCE).strip("\n")
 
 
 def load_system_prompt(path: Optional[str], allow_default: bool = True) -> str:
-    """Return the content of a system prompt file, or the packaged default."""
     if path:
-        file_path = Path(path)
+        file_path = Path(path).expanduser()
         if not file_path.exists():
-            return _read_default_system_prompt() if allow_default else ""
-        try:
-            return file_path.read_text(encoding="utf-8").strip("\n")
-        except OSError as exc:
-            print(f"[Warning] Could not read system prompt file '{path}': {exc}", file=sys.stderr)
-            return ""
+            print(f"[Warning] System prompt file '{file_path}' not found; continuing without it.", file=sys.stderr)
+        else:
+            try:
+                return file_path.read_text(encoding="utf-8").strip("\n")
+            except OSError as exc:
+                print(f"[Warning] Could not read system prompt file '{file_path}': {exc}", file=sys.stderr)
     if allow_default:
-        return _read_default_system_prompt()
+        default_path = Path.cwd() / Path(_DEFAULT_SYSTEM_PROMPT_RESOURCE).name
+        if default_path.exists():
+            try:
+                return default_path.read_text(encoding="utf-8").strip("\n")
+            except OSError:
+                pass
+        return _load_default_system_prompt()
     return ""
 
 
 def compose_prompt(*parts: Optional[str]) -> str:
-    """Combine the provided string parts into a single message."""
     collected: List[str] = []
     for part in parts:
         if part and part.strip():
@@ -63,14 +67,11 @@ def compose_prompt(*parts: Optional[str]) -> str:
 
 
 def strip_think_segments(text: str) -> str:
-    """Return text with <think> sections removed."""
     if not text:
         return ""
-
     result: List[str] = []
     idx = 0
     in_think = False
-
     while idx < len(text):
         if in_think:
             close_idx = text.find("</think>", idx)
@@ -83,31 +84,25 @@ def strip_think_segments(text: str) -> str:
             if open_idx == -1:
                 result.append(text[idx:])
                 break
-
             if open_idx > idx:
                 result.append(text[idx:open_idx])
             idx = open_idx + len("<think>")
             in_think = True
-
     return "".join(result).strip()
 
 
 def colorize_response(text: str) -> str:
-    """Return the response string with ANSI colors applied to think segments."""
     if not text:
         return ""
-
     idx = 0
     in_think = False
     output: List[str] = []
-
     while idx < len(text):
         if in_think:
             close_idx = text.find("</think>", idx)
             if close_idx == -1:
                 output.append(f"{YELLOW}{text[idx:]}{RESET}")
                 break
-
             if close_idx > idx:
                 output.append(f"{YELLOW}{text[idx:close_idx]}{RESET}")
             output.append(f"{YELLOW}</think>{RESET}")
@@ -118,18 +113,15 @@ def colorize_response(text: str) -> str:
             if open_idx == -1:
                 output.append(f"{ANSWER_COLOR}{text[idx:]}{RESET}")
                 break
-
             if open_idx > idx:
                 output.append(f"{ANSWER_COLOR}{text[idx:open_idx]}{RESET}")
             output.append(f"{YELLOW}<think>{RESET}")
             idx = open_idx + len("<think>")
             in_think = True
-
     return "".join(output)
 
 
 def print_stream_chunk(text: str, in_think: bool) -> Tuple[bool, str]:
-    """Stream a chunk of text with think/final color separation."""
     idx = 0
     final_parts: List[str] = []
     while idx < len(text):
@@ -166,27 +158,61 @@ def print_stream_chunk(text: str, in_think: bool) -> Tuple[bool, str]:
     return in_think, "".join(final_parts)
 
 
-def load_config(path: Optional[str]) -> Dict[str, object]:
-    """Load YAML configuration from the provided path."""
-    if not path:
-        return {}
-    file_path = Path(path)
-    if not file_path.exists():
-        return {}
+# ---------------------------------------------------------------------------
+# Configuration loading
+# ---------------------------------------------------------------------------
+
+SEARCH_CONFIG_LOCATIONS = (
+    lambda: (Path.cwd() / _DEFAULT_CONFIG_FILENAME),
+    lambda: (Path.home() / ".config" / "bsy-clippy" / _DEFAULT_CONFIG_FILENAME),
+)
+
+
+def _load_yaml_file(path: Path) -> Optional[Dict[str, object]]:
+    if not path.exists():
+        return None
     try:
-        with file_path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
     except (OSError, yaml.YAMLError) as exc:
         print(f"[Warning] Failed to read configuration file '{path}': {exc}", file=sys.stderr)
-        return {}
+        return None
     if not isinstance(data, dict):
         print(f"[Warning] Configuration file '{path}' must contain a YAML mapping.", file=sys.stderr)
-        return {}
+        return None
     return data
 
 
+def _load_packaged_config() -> Dict[str, object]:
+    text = _read_text_resource("data/bsy-clippy.yaml")
+    if not text:
+        return {}
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        print(f"[Warning] Failed to parse packaged configuration: {exc}", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_config(path: Optional[str]) -> Tuple[Dict[str, object], Optional[str]]:
+    if path:
+        candidate = Path(path).expanduser()
+        data = _load_yaml_file(candidate)
+        if data is not None:
+            return data, str(candidate)
+        return {}, str(candidate)
+
+    for resolver in SEARCH_CONFIG_LOCATIONS:
+        candidate = resolver()
+        data = _load_yaml_file(candidate)
+        if data is not None:
+            return data, str(candidate)
+
+    return _load_packaged_config(), "packaged sample"
+
+
 def select_api_profile(api_config: Dict[str, object], override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, object]]:
-    """Return the active API profile settings and its name."""
     if not isinstance(api_config, dict):
         return None, {}
 
@@ -195,9 +221,8 @@ def select_api_profile(api_config: Dict[str, object], override: Optional[str] = 
     }
 
     profiles = api_config.get("profiles")
-    profile_name = api_config.get("profile")
-    default_name = profile_name if isinstance(profile_name, str) else None
-    selected_name: Optional[str] = override or default_name
+    profile_name = str(api_config.get("profile")) if isinstance(api_config.get("profile"), str) else None
+    selected_name = override or profile_name
 
     if isinstance(profiles, dict) and profiles:
         profile_map: Dict[str, Dict[str, object]] = {
@@ -223,69 +248,81 @@ def select_api_profile(api_config: Dict[str, object], override: Optional[str] = 
     return selected_name, base_settings
 
 
-def resolve_base_url(
-    settings: Dict[str, object],
-    ip_override: Optional[str],
-    port_override: Optional[str],
-) -> Tuple[str, Optional[str], Optional[str]]:
-    """Return base URL plus normalized host/port used for display or overrides."""
-    base_url = str(settings.get("base_url", "")).strip()
-    raw_ip = ip_override if ip_override is not None else settings.get("ip")
-    raw_port = port_override if port_override is not None else settings.get("port")
-    ip = str(raw_ip).strip() if raw_ip is not None else ""
-    port = str(raw_port).strip() if raw_port is not None else ""
-
-    if base_url:
-        try:
-            from urllib.parse import urlparse
-
-            parsed = urlparse(base_url)
-            if parsed.scheme and parsed.netloc:
-                host = parsed.hostname or (ip or None)
-                port_from_url = parsed.port
-                if host and port_from_url:
-                    return base_url, host, str(port_from_url)
-        except Exception:
-            pass
-        if ip and port:
-            return base_url, ip, port
-        return base_url, ip or None, port or None
-
-    if ip and port:
-        normalized = f"http://{ip}:{port}/v1"
-        return normalized, ip, port
-
-    return _DEFAULT_BASE_URL, None, None
+# ---------------------------------------------------------------------------
+# Provider implementations
+# ---------------------------------------------------------------------------
 
 
-def create_openai_client(base_url: str) -> OpenAI:
-    """Create an OpenAI client using environment credentials."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print(
-            "[Error] OPENAI_API_KEY is not set. Create a .env file with OPENAI_API_KEY=<token> or export it.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+def call_ollama_batch(base_url: str, model: str, prompt: str, temperature: float) -> Tuple[str, str]:
+    endpoint = base_url.rstrip("/") + "/api/generate"
     try:
-        return OpenAI(api_key=api_key, base_url=base_url)
-    except OpenAIError as exc:
-        print(f"[Error] Could not initialize OpenAI client: {exc}", file=sys.stderr)
-        sys.exit(1)
+        response = requests.post(
+            endpoint,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "temperature": temperature,
+            },
+            stream=True,
+            timeout=600,
+        )
+        response.raise_for_status()
+        output: List[str] = []
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            output.append(data.get("response", ""))
+            if data.get("done"):
+                break
+        raw_text = "".join(output)
+        return colorize_response(raw_text), strip_think_segments(raw_text)
+    except requests.RequestException as exc:
+        error_text = f"[Error contacting Ollama API: {exc}]"
+        return error_text, ""
 
 
-def build_messages(system_prompt: str, user_content: str) -> List[Dict[str, str]]:
-    """Construct chat-completion style messages for the OpenAI API."""
-    messages: List[Dict[str, str]] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    if user_content:
-        messages.append({"role": "user", "content": user_content})
-    return messages
+def call_ollama_stream(base_url: str, model: str, prompt: str, temperature: float) -> str:
+    endpoint = base_url.rstrip("/") + "/api/generate"
+    try:
+        response = requests.post(
+            endpoint,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "temperature": temperature,
+            },
+            stream=True,
+            timeout=600,
+        )
+        response.raise_for_status()
+        in_think = False
+        final_parts: List[str] = []
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            text = data.get("response", "")
+            if text:
+                in_think, segment = print_stream_chunk(text, in_think)
+                if segment:
+                    final_parts.append(segment)
+            if data.get("done"):
+                break
+        print()
+        return strip_think_segments("".join(final_parts))
+    except requests.RequestException as exc:
+        print(f"[Error contacting Ollama API: {exc}]")
+        return ""
 
 
-def _extract_content(raw: Union[str, List[object], None]) -> str:
-    """Normalize OpenAI content payloads into a plain string."""
+def _extract_content(raw) -> str:
     if raw is None:
         return ""
     if isinstance(raw, str):
@@ -313,7 +350,6 @@ def call_openai_batch(
     messages: List[Dict[str, str]],
     temperature: float,
 ) -> Tuple[str, str]:
-    """Send a prompt to the OpenAI API and return the formatted and raw text."""
     try:
         response = client.chat.completions.create(
             model=model,
@@ -323,15 +359,10 @@ def call_openai_batch(
     except OpenAIError as exc:
         error_text = f"[Error contacting OpenAI API: {exc}]"
         return error_text, ""
-
     if not response.choices:
         return "[No response received]", ""
-
-    choice = response.choices[0]
-    message = getattr(choice, "message", None)
-    content = ""
-    if message is not None:
-        content = _extract_content(getattr(message, "content", None))
+    message = getattr(response.choices[0], "message", None)
+    content = _extract_content(getattr(message, "content", None)) if message is not None else ""
     return colorize_response(content), strip_think_segments(content)
 
 
@@ -341,7 +372,6 @@ def call_openai_stream(
     messages: List[Dict[str, str]],
     temperature: float,
 ) -> str:
-    """Send a prompt to the OpenAI API and stream response with color separation."""
     try:
         stream = client.chat.completions.create(
             model=model,
@@ -352,7 +382,6 @@ def call_openai_stream(
     except OpenAIError as exc:
         print(f"[Error contacting OpenAI API: {exc}]")
         return ""
-
     in_think = False
     final_parts: List[str] = []
     try:
@@ -368,20 +397,71 @@ def call_openai_stream(
                         final_parts.append(segment)
         print()
     finally:
-        # Ensure the generator is closed to free resources
         try:
             stream.close()  # type: ignore[attr-defined]
         except Exception:
             pass
-
     return strip_think_segments("".join(final_parts))
 
 
+class Provider:
+    def __init__(self, name: str, base_url: str, model: str) -> None:
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def stream(self, system_prompt: str, user_prompt: str, conversation_input: str, temperature: float) -> str:
+        raise NotImplementedError
+
+    def batch(self, system_prompt: str, user_prompt: str, conversation_input: str, temperature: float) -> Tuple[str, str]:
+        raise NotImplementedError
+
+
+class OllamaProvider(Provider):
+    def __init__(self, base_url: str, model: str) -> None:
+        super().__init__("ollama", base_url, model)
+
+    def stream(self, system_prompt: str, user_prompt: str, conversation_input: str, temperature: float) -> str:
+        prompt = compose_prompt(system_prompt, user_prompt, conversation_input)
+        return call_ollama_stream(self.base_url, self.model, prompt, temperature)
+
+    def batch(self, system_prompt: str, user_prompt: str, conversation_input: str, temperature: float) -> Tuple[str, str]:
+        prompt = compose_prompt(system_prompt, user_prompt, conversation_input)
+        return call_ollama_batch(self.base_url, self.model, prompt, temperature)
+
+
+class OpenAIProvider(Provider):
+    def __init__(self, client: OpenAI, base_url: str, model: str) -> None:
+        super().__init__("openai", base_url, model)
+        self.client = client
+
+    def stream(self, system_prompt: str, user_prompt: str, conversation_input: str, temperature: float) -> str:
+        user_content = compose_prompt(user_prompt, conversation_input)
+        messages = build_messages(system_prompt, user_content)
+        return call_openai_stream(self.client, self.model, messages, temperature)
+
+    def batch(self, system_prompt: str, user_prompt: str, conversation_input: str, temperature: float) -> Tuple[str, str]:
+        user_content = compose_prompt(user_prompt, conversation_input)
+        messages = build_messages(system_prompt, user_content)
+        return call_openai_batch(self.client, self.model, messages, temperature)
+
+
+# ---------------------------------------------------------------------------
+# Input helpers
+# ---------------------------------------------------------------------------
+
+def build_messages(system_prompt: str, user_content: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    if user_content:
+        messages.append({"role": "user", "content": user_content})
+    return messages
+
+
 def read_user_input(prompt_text: str, input_stream: Optional[IO[str]]) -> str:
-    """Read a line of input, supporting non-tty streams."""
     if input_stream is None:
         return input(prompt_text)
-
     print(prompt_text, end="", flush=True)
     line = input_stream.readline()
     if not line:
@@ -389,10 +469,12 @@ def read_user_input(prompt_text: str, input_stream: Optional[IO[str]]) -> str:
     return line.rstrip("\r\n")
 
 
+# ---------------------------------------------------------------------------
+# Interactive loop
+# ---------------------------------------------------------------------------
+
 def interactive_mode(
-    client: OpenAI,
-    base_url: str,
-    model: str,
+    provider: Provider,
     mode: str,
     temperature: float,
     system_prompt: str,
@@ -402,14 +484,15 @@ def interactive_mode(
     memory_seed: Optional[Sequence[str]] = None,
     input_stream: Optional[IO[str]] = None,
 ) -> None:
-    """Interactive chat mode with selectable output mode."""
     profile_info = f" (profile '{profile_name}')" if profile_name else ""
-    print(f"Interactive mode with model '{model}' via {base_url}{profile_info}")
-    print(f"Mode: {mode}, Temperature: {temperature}")
+    print(f"Interactive mode with model '{provider.model}' via {provider.base_url}{profile_info}")
+    print(f"Mode: {mode}, Temperature: {temperature} (provider: {provider.name})")
     print("Type 'exit' or Ctrl+C to quit.")
+
     memory: List[str] = list(memory_seed) if memory_seed else []
     if memory_lines > 0 and memory:
         memory[:] = memory[-memory_lines:]
+
     local_stream = input_stream
     close_stream = False
     if local_stream is None:
@@ -446,26 +529,18 @@ def interactive_mode(
             user_text = prompt.strip()
             if user_text.lower() in {"exit", "quit"}:
                 break
-            history_block = ""
-            if memory:
-                history_block = "History of Past Interaction:\n" + "\n".join(memory)
 
-            current_block = ""
-            if user_text:
-                current_block = f"Current User Message:\n{user_text}"
-
+            history_block = "History of Past Interaction:\n" + "\n".join(memory) if memory else ""
+            current_block = f"Current User Message:\n{user_text}" if user_text else ""
             conversation_parts = [part for part in (history_block, current_block) if part]
             conversation_input = "\n\n".join(conversation_parts)
-            user_content = compose_prompt(user_prompt, conversation_input)
-            messages = build_messages(system_prompt, user_content)
-            if not messages:
-                continue
+
             final_text = ""
             if mode == "stream":
                 print("LLM (thinking): ", end="", flush=True)
-                final_text = call_openai_stream(client, model, messages, temperature)
+                final_text = provider.stream(system_prompt, user_prompt, conversation_input, temperature)
             else:
-                response_text, final_text = call_openai_batch(client, model, messages, temperature)
+                response_text, final_text = provider.batch(system_prompt, user_prompt, conversation_input, temperature)
                 print(response_text)
 
             if memory_lines > 0:
@@ -483,14 +558,107 @@ def interactive_mode(
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Provider construction
+# ---------------------------------------------------------------------------
+
+
+def _iter_dotenv_candidates(config_source: Optional[str]) -> List[Path]:
+    discovered = find_dotenv(usecwd=True)
+    candidates: List[Path] = []
+    if discovered:
+        candidates.append(Path(discovered))
+    candidates.append(Path.cwd() / ".env")
+    if config_source:
+        source_path = Path(config_source).expanduser()
+        base_dir = source_path.parent if source_path.is_file() else source_path
+        candidates.append(base_dir / ".env")
+
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.exists():
+            unique.append(resolved)
+    return unique
+
+
+def _resolve_api_key(env_var: str, config_source: Optional[str]) -> Optional[str]:
+    direct = os.getenv(env_var)
+    if direct:
+        return direct
+
+    for dotenv_path in _iter_dotenv_candidates(config_source):
+        values = dotenv_values(str(dotenv_path))
+        if not values:
+            continue
+        candidate = values.get(env_var)
+        if candidate:
+            return candidate
+        if env_var != "OPENAI_API_KEY":
+            fallback = values.get("OPENAI_API_KEY")
+            if fallback:
+                return fallback
+    return None
+
+
+def create_openai_client(
+    base_url: str,
+    require_api_key: bool,
+    env_var: str = "OPENAI_API_KEY",
+    config_source: Optional[str] = None,
+) -> OpenAI:
+    api_key = _resolve_api_key(env_var, config_source)
+    if not api_key:
+        if require_api_key:
+            print(
+                f"[Error] {env_var} is not set. Export it or add it to a .env file.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        api_key = "not-set"
+    try:
+        return OpenAI(api_key=api_key, base_url=base_url)
+    except OpenAIError as exc:
+        print(f"[Error] Could not initialize OpenAI client: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def determine_provider(profile_settings: Dict[str, object], profile_name: Optional[str]) -> str:
+    provider = profile_settings.get("provider")
+    if isinstance(provider, str) and provider.strip():
+        return provider.strip().lower()
+    if profile_name and profile_name.lower() == "ollama":
+        return "ollama"
+    return "openai"
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
 def build_parser() -> argparse.ArgumentParser:
-    """Create the argument parser for the CLI."""
-    parser = argparse.ArgumentParser(description="bsy-clippy: OpenAI-compatible CLI client")
+    parser = argparse.ArgumentParser(description="bsy-clippy: configurable chat CLI")
+
+    cwd_config = (Path.cwd() / _DEFAULT_CONFIG_FILENAME).resolve()
+    sample_path = resources.files("bsy_clippy").joinpath("data/bsy-clippy.yaml")
+    config_help = (
+        "Path to a YAML config file controlling profiles. "
+        f"Default search order: {cwd_config}, ~/.config/bsy-clippy/{_DEFAULT_CONFIG_FILENAME}. "
+        f"Sample bundled at {sample_path}."
+    )
     parser.add_argument(
         "-cfg",
         "--config",
-        default=_DEFAULT_CONFIG,
-        help=f"Path to a YAML config file (default: {_DEFAULT_CONFIG})",
+        default=None,
+        help=config_help,
     )
     parser.add_argument(
         "--profile",
@@ -501,39 +669,39 @@ def build_parser() -> argparse.ArgumentParser:
         "-i",
         "--ip",
         default=None,
-        help="Override IP address for OpenAI-compatible endpoints (default: use config or base URL)",
+        help="Override IP address for Ollama-compatible endpoints",
     )
     parser.add_argument(
         "-p",
         "--port",
         default=None,
-        help="Override port for OpenAI-compatible endpoints (default: use config or base URL)",
+        help="Override port for Ollama-compatible endpoints",
     )
     parser.add_argument(
         "-b",
         "--base-url",
         default=None,
-        help="Explicit OpenAI API base URL (default: derived from config or https://api.openai.com/v1)",
+        help="Explicit API base URL (overrides config)",
     )
     parser.add_argument(
         "-M",
         "--model",
         default=None,
-        help=f"Model name (default: value from config or {_DEFAULT_MODEL})",
+        help="Model name (default: value from profile or provider default)",
     )
     parser.add_argument(
         "-m",
         "--mode",
         choices=["stream", "batch"],
         default="stream",
-        help="Output mode: 'stream' = real-time, 'batch' = wait for final output",
+        help="Output mode: 'stream' = real-time, 'batch' = wait for full output",
     )
     parser.add_argument(
         "-t",
         "--temperature",
         type=float,
         default=0.7,
-        help="Sampling temperature (default: 0.7, higher = more random)",
+        help="Sampling temperature (default: 0.7)",
     )
     parser.add_argument(
         "-s",
@@ -568,49 +736,62 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    config_data = load_config(args.config)
+    config_data, config_source = load_config(args.config)
     api_config = config_data.get("api") if isinstance(config_data.get("api"), dict) else {}
     active_profile, profile_settings = select_api_profile(api_config, args.profile)
 
-    base_url, _, _ = resolve_base_url(
-        profile_settings,
-        args.ip if args.ip is not None else None,
-        args.port if args.port is not None else None,
+    provider_name = determine_provider(profile_settings, active_profile)
+
+    base_url = args.base_url or str(profile_settings.get("base_url", "")).strip()
+    if provider_name == "ollama":
+        ip = args.ip or profile_settings.get("ip")
+        port = args.port or profile_settings.get("port")
+        if not base_url:
+            if ip and port:
+                base_url = f"http://{ip}:{port}"
+            else:
+                base_url = "http://127.0.0.1:11434"
+    else:
+        if not base_url:
+            base_url = _DEFAULT_OPENAI_BASE_URL
+
+    model = args.model or str(profile_settings.get("model", "")).strip() or (
+        "qwen3:1.7b" if provider_name == "ollama" else "gpt-4o-mini"
     )
-    if args.base_url:
-        base_url = args.base_url
-    model = args.model or profile_settings.get("model") or _DEFAULT_MODEL
 
     allow_default = not args.no_default_system
-    system_prompt = load_system_prompt(args.system_file, allow_default=allow_default)
+    system_prompt = load_system_prompt(args.system_file, allow_default)
+
     user_prompt = args.user_prompt
     memory_lines = max(0, args.memory_lines)
     chat_after_stdin = args.chat_after_stdin
     temperature = args.temperature
 
-    client = create_openai_client(base_url)
+    if provider_name == "ollama":
+        provider: Provider = OllamaProvider(base_url, model)
+    else:
+        require_key = provider_name == "openai"
+        env_var = str(profile_settings.get("api_key_env", "OPENAI_API_KEY"))
+        client = create_openai_client(base_url, require_key, env_var, config_source)
+        provider = OpenAIProvider(client, base_url, model)
 
     mode = args.mode
     if mode is None:
-        if not sys.stdin.isatty():
-            mode = "batch"
-        else:
-            mode = "stream"
+        mode = "batch" if not sys.stdin.isatty() else "stream"
 
     if not sys.stdin.isatty():
         data = sys.stdin.read()
-        user_content = compose_prompt(user_prompt, data)
-        messages = build_messages(system_prompt, user_content)
-
-        if not messages:
+        if not data.strip():
             interactive_mode(
-                client,
-                base_url,
-                model,
+                provider,
                 mode,
                 temperature,
                 system_prompt,
@@ -620,26 +801,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             return
 
-        memory_seed: List[str] = []
-        data_text = data.strip()
-        if data_text:
-            memory_seed.append(f"User: {data_text}")
-
         final_text = ""
         if mode == "stream":
-            final_text = call_openai_stream(client, model, messages, temperature)
+            print("LLM (thinking): ", end="", flush=True)
+            final_text = provider.stream(system_prompt, user_prompt, data, temperature)
         else:
-            response_text, final_text = call_openai_batch(client, model, messages, temperature)
+            response_text, final_text = provider.batch(system_prompt, user_prompt, data, temperature)
             print(response_text)
+
         if chat_after_stdin:
+            memory_seed: List[str] = []
+            data_text = data.strip()
+            if data_text:
+                memory_seed.append(f"User: {data_text}")
             if final_text:
                 memory_seed.append(f"Assistant: {final_text.strip()}")
             if memory_lines > 0 and memory_seed:
                 memory_seed = memory_seed[-memory_lines:]
             interactive_mode(
-                client,
-                base_url,
-                model,
+                provider,
                 mode,
                 temperature,
                 system_prompt,
@@ -651,9 +831,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
 
     interactive_mode(
-        client,
-        base_url,
-        model,
+        provider,
         mode,
         temperature,
         system_prompt,
