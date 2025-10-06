@@ -15,3 +15,8 @@ api:
        base_url: https://chat.ai.e-infra.cz/api
        model: qwen3-coder
        api_key_env: CESNET_API_KEY
+    ctu:
+      provider: ollama
+      base_url: https://147.32.80.44:11434
+      model: qwen3:1.7b
+
