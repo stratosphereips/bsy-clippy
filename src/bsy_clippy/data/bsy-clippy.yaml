@@ -1,0 +1,17 @@
+api:
+  profile: ollama
+  profiles:
+    ollama:
+      provider: ollama
+      base_url: http://172.20.0.100:11434
+      model: qwen3:1.7b
+    openai:
+       provider: openai
+       base_url: https://api.openai.com/v1
+       model: gpt-4o-mini
+       api_key_env: OPENAI_API_KEY
+    cesnet:
+       provider: openai
+       base_url: https://chat.ai.e-infra.cz/api
+       model: qwen3-coder
+       api_key_env: CESNET_API_KEY
