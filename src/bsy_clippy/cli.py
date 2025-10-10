@@ -4,7 +4,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import shutil
 import sys
+import tempfile
+import re
+
+try:  # pragma: no cover - fallback only for older Python
+    from importlib import metadata as importlib_metadata
+except ImportError:  # pragma: no cover
+    try:
+        import importlib_metadata  # type: ignore
+    except ImportError:
+        importlib_metadata = None  # type: ignore
+
 from importlib import resources
 from pathlib import Path
 from typing import IO, Dict, List, Optional, Sequence, Tuple
@@ -64,6 +77,46 @@ def compose_prompt(*parts: Optional[str]) -> str:
         if part and part.strip():
             collected.append(part.strip("\n"))
     return "\n\n".join(collected)
+
+
+def get_app_version() -> str:
+    if importlib_metadata is not None:
+        try:
+            return importlib_metadata.version("bsy-clippy")
+        except Exception:
+            pass
+
+    project_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    try:
+        text = project_path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+
+    if text:
+        toml_loader = None
+        try:
+            import tomllib  # type: ignore[attr-defined]
+
+            toml_loader = tomllib  # type: ignore[assignment]
+        except ModuleNotFoundError:
+            toml_loader = None
+
+        if toml_loader:
+            try:
+                data = toml_loader.loads(text)
+                project_data = data.get("project")
+                if isinstance(project_data, dict):
+                    version = project_data.get("version")
+                    if version:
+                        return str(version)
+            except Exception:
+                pass
+
+        match = re.search(r'^\s*version\s*=\s*"([^"]+)"\s*$', text, re.MULTILINE)
+        if match:
+            return match.group(1)
+
+    return "unknown"
 
 
 def strip_think_segments(text: str) -> str:
@@ -469,6 +522,181 @@ def read_user_input(prompt_text: str, input_stream: Optional[IO[str]]) -> str:
     return line.rstrip("\r\n")
 
 
+def _extract_tool_requests(raw_text: str) -> Tuple[str, List[Dict[str, object]]]:
+    if not raw_text:
+        return "", []
+    decoder = json.JSONDecoder()
+    idx = 0
+    last_idx = 0
+    length = len(raw_text)
+    requests: List[Dict[str, object]] = []
+    sanitized_segments: List[str] = []
+
+    while idx < length:
+        brace_idx = raw_text.find("{", idx)
+        if brace_idx == -1:
+            break
+        try:
+            obj, end_idx = decoder.raw_decode(raw_text, brace_idx)
+        except ValueError:
+            idx = brace_idx + 1
+            continue
+
+        sanitized_segments.append(raw_text[last_idx:brace_idx])
+        idx = end_idx
+
+        if not isinstance(obj, dict):
+            sanitized_segments.append(raw_text[brace_idx:end_idx])
+            last_idx = end_idx
+            continue
+
+        cmd_value = obj.get("cmd")
+        if cmd_value is None:
+            sanitized_segments.append(raw_text[brace_idx:end_idx])
+            last_idx = end_idx
+            continue
+
+        cmd_str = str(cmd_value).strip()
+        if not cmd_str:
+            sanitized_segments.append(raw_text[brace_idx:end_idx])
+            last_idx = end_idx
+            continue
+
+        parms_value = obj.get("parms")
+        if parms_value is None and "params" in obj:
+            parms_value = obj.get("params")
+
+        if isinstance(parms_value, list):
+            parms_list = [str(item) for item in parms_value]
+        elif parms_value in (None,):
+            parms_list = []
+        else:
+            parms_list = [str(parms_value)]
+
+        requests.append({"cmd": cmd_str, "parms": parms_list})
+        last_idx = end_idx
+
+    sanitized_segments.append(raw_text[last_idx:])
+    sanitized_text = "".join(sanitized_segments).strip()
+    return sanitized_text, requests
+
+
+def _prompt_yes_no(prompt_text: str, input_stream: Optional[IO[str]]) -> bool:
+    current_prompt = prompt_text
+    while True:
+        try:
+            response = read_user_input(current_prompt, input_stream)
+        except EOFError:
+            print("\n[Tool] No confirmation received; skipping command.")
+            return False
+        except KeyboardInterrupt:
+            print("\n[Tool] Command cancelled by user.")
+            return False
+
+        normalized = response.strip().lower()
+        if normalized in {"y", "yes"}:
+            return True
+        if normalized in {"", "n", "no"}:
+            return False
+        current_prompt = "Please respond with 'y' or 'n': "
+
+
+def _interpret_exit_status(status: int) -> int:
+    if status < 0:
+        return status
+    signal = status & 0x7F
+    if signal:
+        return -signal
+    return (status >> 8) & 0xFF
+
+
+def _execute_tool_command(cmd: str, parms: Sequence[str]) -> Tuple[str, str, int]:
+    args = [str(cmd)] + [str(item) for item in parms]
+    command_display = shlex.join(args)
+    tee_available = shutil.which("tee") is not None and os.name != "nt"
+
+    temp_handle = tempfile.NamedTemporaryFile(delete=False)
+    temp_handle.close()
+    temp_path = temp_handle.name
+
+    try:
+        if tee_available:
+            shell_command = f"{command_display} 2>&1 | tee {shlex.quote(temp_path)}"
+        else:
+            shell_command = f"{command_display} > {shlex.quote(temp_path)} 2>&1"
+
+        print(f"[Tool] Executing: {command_display}")
+        status = os.system(shell_command)
+
+        try:
+            output_text = Path(temp_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            output_text = ""
+
+        if not tee_available and output_text:
+            print(output_text, end="" if output_text.endswith("\n") else "\n")
+
+        exit_status = _interpret_exit_status(status)
+        if status >= 0 and (status & 0x7F):
+            print(f"[Tool] Command terminated by signal {status & 0x7F}.")
+        print(f"[Tool] Exit status: {exit_status}")
+
+        return command_display, output_text, exit_status
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def handle_tool_requests(raw_text: str, input_stream: Optional[IO[str]]) -> Tuple[str, List[str]]:
+    sanitized_text, requests = _extract_tool_requests(raw_text)
+    if not requests:
+        return raw_text.strip(), []
+
+    processed_text = sanitized_text.strip()
+    appended_chunks: List[str] = []
+    history_entries: List[str] = []
+
+    for request in requests:
+        cmd = str(request.get("cmd", "")).strip()
+        if not cmd:
+            continue
+        parms = [str(item) for item in request.get("parms", [])]
+        command_display = shlex.join([cmd, *parms])
+
+        print(f"\n[Tool Request] {command_display}")
+        if not _prompt_yes_no("Execute command? [y/N]: ", input_stream):
+            print("[Tool] Command skipped.")
+            appended_chunks.append(f"[Command skipped: {command_display}]")
+            history_entries.append(f"Tool: {command_display} (skipped)")
+            continue
+
+        executed_display, output_text, exit_status = _execute_tool_command(cmd, parms)
+        snippet = output_text.strip()
+        note = f"[Command executed: {executed_display} (exit {exit_status})]"
+        if snippet:
+            note = f"{note}\n{snippet}"
+        appended_chunks.append(note)
+
+        history_entry = f"Tool: {executed_display} (exit {exit_status})"
+        if snippet:
+            history_entry = f"{history_entry}\n{snippet}"
+        history_entries.append(history_entry)
+
+    combined_note = "\n\n".join(chunk for chunk in appended_chunks if chunk).strip()
+    if combined_note:
+        if processed_text:
+            processed_text = f"{processed_text}\n\n{combined_note}".strip()
+        else:
+            processed_text = combined_note
+
+    if not processed_text:
+        processed_text = "[Tool command processed]"
+
+    return processed_text, history_entries
+
+
 # ---------------------------------------------------------------------------
 # Interactive loop
 # ---------------------------------------------------------------------------
@@ -485,7 +713,8 @@ def interactive_mode(
     input_stream: Optional[IO[str]] = None,
 ) -> None:
     profile_info = f" (profile '{profile_name}')" if profile_name else ""
-    print(f"Interactive mode with model '{provider.model}' via {provider.base_url}{profile_info}")
+    version = get_app_version()
+    print(f"bsy-clippy {version} | model '{provider.model}' via {provider.base_url}{profile_info}")
     print(f"Mode: {mode}, Temperature: {temperature} (provider: {provider.name})")
     print("Type 'exit' or Ctrl+C to quit.")
 
@@ -543,11 +772,16 @@ def interactive_mode(
                 response_text, final_text = provider.batch(system_prompt, user_prompt, conversation_input, temperature)
                 print(response_text)
 
+            final_text, tool_history_entries = handle_tool_requests(final_text, local_stream)
+
             if memory_lines > 0:
                 if user_text:
                     memory.append(f"User: {user_text}")
                 if final_text:
                     memory.append(f"Assistant: {final_text.strip()}")
+                for entry in tool_history_entries:
+                    if entry:
+                        memory.append(entry.strip())
                 if len(memory) > memory_lines:
                     memory[:] = memory[-memory_lines:]
     finally:
@@ -809,6 +1043,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             response_text, final_text = provider.batch(system_prompt, user_prompt, data, temperature)
             print(response_text)
 
+        final_text, tool_history_entries = handle_tool_requests(final_text, None)
+
         if chat_after_stdin:
             memory_seed: List[str] = []
             data_text = data.strip()
@@ -816,6 +1052,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 memory_seed.append(f"User: {data_text}")
             if final_text:
                 memory_seed.append(f"Assistant: {final_text.strip()}")
+            for entry in tool_history_entries:
+                if entry:
+                    memory_seed.append(entry.strip())
             if memory_lines > 0 and memory_seed:
                 memory_seed = memory_seed[-memory_lines:]
             interactive_mode(
