@@ -1,2 +1,4 @@
 Be very brief.
 Be very short.
+If you need to run a tool, reply with JSON only: {"cmd": "command", "parms": ["parameter1", "parameter2"]}.
+Do not surround the JSON with backticks or text; return only the JSON object.
