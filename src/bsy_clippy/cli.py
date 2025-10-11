@@ -35,6 +35,16 @@ _DEFAULT_SYSTEM_PROMPT_RESOURCE = "data/bsy-clippy.txt"
 _DEFAULT_CONFIG_FILENAME = "bsy-clippy.yaml"
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
+MAX_CONTEXT_TOKENS = 65_536
+AVERAGE_CHARS_PER_TOKEN = 4
+MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * AVERAGE_CHARS_PER_TOKEN
+TOOL_OUTPUT_SUMMARY_CHAR_LIMIT = 16_384
+DEFAULT_SUMMARY_CHUNK_SIZE = 4_096
+MIN_SUMMARY_CHUNK_SIZE = 512
+SUMMARY_SEPARATOR = "\n---\n"
+SUMMARY_NOTICE = "[Tool output summarized]"
+MAX_SUMMARY_ITERATIONS = 6
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -172,6 +182,85 @@ def colorize_response(text: str) -> str:
             idx = open_idx + len("<think>")
             in_think = True
     return "".join(output)
+
+
+def _split_text_into_chunks(text: str, chunk_size: int) -> List[str]:
+    chunk_size = max(chunk_size, MIN_SUMMARY_CHUNK_SIZE)
+    return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def _summarize_chunk_text(chunk: str) -> str:
+    snippet = chunk.strip()
+    if not snippet:
+        return ""
+
+    if len(snippet) <= MIN_SUMMARY_CHUNK_SIZE:
+        return snippet
+
+    lines = snippet.splitlines()
+    if len(lines) <= 8:
+        return snippet
+
+    head = lines[:3]
+    tail = lines[-3:]
+    omitted = max(0, len(lines) - len(head) - len(tail))
+
+    summary: List[str] = []
+    summary.extend(head)
+    if omitted > 0:
+        summary.append(f"... ({omitted} more lines omitted) ...")
+    summary.extend(tail)
+
+    condensed = "\n".join(summary).strip()
+    if not condensed:
+        return snippet[:MIN_SUMMARY_CHUNK_SIZE]
+    return condensed
+
+
+def _summarize_iteratively(text: str, limit: int, chunk_size: int = DEFAULT_SUMMARY_CHUNK_SIZE) -> Tuple[str, bool]:
+    current = text.strip()
+    if len(current) <= limit:
+        return current, False
+
+    chunk_size = max(chunk_size, MIN_SUMMARY_CHUNK_SIZE)
+    iteration = 0
+
+    while len(current) > limit and chunk_size >= MIN_SUMMARY_CHUNK_SIZE and iteration < MAX_SUMMARY_ITERATIONS:
+        chunks = _split_text_into_chunks(current, chunk_size)
+        chunk_summaries: List[str] = []
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            summary = _summarize_chunk_text(chunk)
+            if not summary:
+                continue
+            header = f"[Chunk {index}/{total}]"
+            chunk_summaries.append(f"{header}\n{summary}")
+        condensed = SUMMARY_SEPARATOR.join(chunk_summaries).strip()
+        if not condensed or len(condensed) >= len(current):
+            break
+        current = condensed
+        chunk_size = max(chunk_size // 2, MIN_SUMMARY_CHUNK_SIZE)
+        iteration += 1
+
+    did_truncate = len(current) < len(text.strip())
+
+    if len(current) > limit:
+        trimmed = current[:limit]
+        if "\n" in trimmed:
+            trimmed = trimmed.rsplit("\n", 1)[0]
+        current = f"{trimmed.rstrip()}\n[...truncated due to context limit...]"
+        did_truncate = True
+
+    return current.strip(), did_truncate
+
+
+def summarize_tool_output(text: str) -> Tuple[str, bool, Tuple[int, int]]:
+    snippet = text.strip()
+    if not snippet:
+        return "", False, (0, 0)
+    summary, truncated = _summarize_iteratively(snippet, TOOL_OUTPUT_SUMMARY_CHAR_LIMIT)
+    line_count = snippet.count("\n") + 1
+    return summary, truncated, (line_count, len(snippet))
 
 
 def print_stream_chunk(text: str, in_think: bool) -> Tuple[bool, str]:
@@ -673,16 +762,26 @@ def handle_tool_requests(raw_text: str, input_stream: Optional[IO[str]]) -> Tupl
             continue
 
         executed_display, output_text, exit_status = _execute_tool_command(cmd, parms)
-        snippet = output_text.strip()
-        note = f"[Command executed: {executed_display} (exit {exit_status})]"
-        if snippet:
-            note = f"{note}\n{snippet}"
-        appended_chunks.append(note)
+        summary_text, was_summarized, metrics = summarize_tool_output(output_text)
+        total_lines, total_chars = metrics
 
-        history_entry = f"Tool: {executed_display} (exit {exit_status})"
-        if snippet:
-            history_entry = f"{history_entry}\n{snippet}"
-        history_entries.append(history_entry)
+        note_lines = [f"[Command executed: {executed_display} (exit {exit_status})]"]
+        history_lines = [f"Tool: {executed_display} (exit {exit_status})"]
+
+        if summary_text:
+            if was_summarized:
+                metrics_text = f"{SUMMARY_NOTICE} (original {total_lines} lines / {total_chars} chars)"
+                note_lines.append(metrics_text)
+                history_lines.append(metrics_text)
+            note_lines.append(summary_text)
+            history_lines.append(summary_text)
+        elif was_summarized:
+            metrics_text = f"{SUMMARY_NOTICE} (original {total_lines} lines / {total_chars} chars)"
+            note_lines.append(metrics_text)
+            history_lines.append(metrics_text)
+
+        appended_chunks.append("\n".join(line for line in note_lines if line).strip())
+        history_entries.append("\n".join(line for line in history_lines if line).strip())
 
     combined_note = "\n\n".join(chunk for chunk in appended_chunks if chunk).strip()
     if combined_note:
