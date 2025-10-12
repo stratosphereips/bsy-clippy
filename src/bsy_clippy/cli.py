@@ -39,10 +39,12 @@ MAX_CONTEXT_TOKENS = 65_536
 AVERAGE_CHARS_PER_TOKEN = 4
 MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * AVERAGE_CHARS_PER_TOKEN
 TOOL_OUTPUT_SUMMARY_CHAR_LIMIT = 16_384
+USER_INPUT_SUMMARY_CHAR_LIMIT = 60_000
 DEFAULT_SUMMARY_CHUNK_SIZE = 4_096
 MIN_SUMMARY_CHUNK_SIZE = 512
 SUMMARY_SEPARATOR = "\n---\n"
 SUMMARY_NOTICE = "[Tool output summarized]"
+USER_SUMMARY_NOTICE = "[User input summarized]"
 MAX_SUMMARY_ITERATIONS = 6
 HELPER_COMMAND_PREFIXES = {"sudo", "doas", "env"}
 DANGEROUS_PRIMARY_COMMANDS = {
@@ -165,6 +167,19 @@ def get_app_version() -> str:
             return match.group(1)
 
     return "unknown"
+
+
+def build_version_banner(version: str, extra: Optional[str] = None) -> str:
+    banner = f"bsy-clippy {version}"
+    if extra:
+        banner = f"{banner} | {extra}"
+    return banner
+
+
+def print_version_banner(version: Optional[str] = None, extra: Optional[str] = None) -> None:
+    if version is None:
+        version = get_app_version()
+    print(build_version_banner(version, extra))
 
 
 def strip_think_segments(text: str) -> str:
@@ -297,6 +312,15 @@ def summarize_tool_output(text: str) -> Tuple[str, bool, Tuple[int, int]]:
     if not snippet:
         return "", False, (0, 0)
     summary, truncated = _summarize_iteratively(snippet, TOOL_OUTPUT_SUMMARY_CHAR_LIMIT)
+    line_count = snippet.count("\n") + 1
+    return summary, truncated, (line_count, len(snippet))
+
+
+def summarize_user_input(text: str) -> Tuple[str, bool, Tuple[int, int]]:
+    snippet = text.strip()
+    if not snippet:
+        return "", False, (0, 0)
+    summary, truncated = _summarize_iteratively(snippet, USER_INPUT_SUMMARY_CHAR_LIMIT)
     line_count = snippet.count("\n") + 1
     return summary, truncated, (line_count, len(snippet))
 
@@ -923,8 +947,7 @@ def interactive_mode(
     input_stream: Optional[IO[str]] = None,
 ) -> None:
     profile_info = f" (profile '{profile_name}')" if profile_name else ""
-    version = get_app_version()
-    print(f"bsy-clippy {version} | model '{provider.model}' via {provider.base_url}{profile_info}")
+    print(f"Model '{provider.model}' via {provider.base_url}{profile_info}")
     print(f"Mode: {mode}, Temperature: {temperature} (provider: {provider.name})")
     print("Type 'exit' or Ctrl+C to quit.")
 
@@ -1186,7 +1209,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+    version = get_app_version()
+    if any(flag in argv_list for flag in ("-h", "--help")):
+        print_version_banner(version)
+    args = parser.parse_args(argv_list)
 
     config_data, config_source = load_config(args.config)
     api_config = config_data.get("api") if isinstance(config_data.get("api"), dict) else {}
@@ -1231,6 +1258,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if mode is None:
         mode = "batch" if not sys.stdin.isatty() else "stream"
 
+    profile_info = f"profile '{active_profile}'" if active_profile else None
+    extra_parts = [f"model '{provider.model}'", f"via {provider.base_url}"]
+    if profile_info:
+        extra_parts.append(f"({profile_info})")
+    banner_extra = " ".join(extra_parts)
+    print_version_banner(version, banner_extra)
+
     if not sys.stdin.isatty():
         data = sys.stdin.read()
         if not data.strip():
@@ -1245,21 +1279,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             return
 
+        summarized_input, input_was_summarized, input_metrics = summarize_user_input(data)
+        if not summarized_input:
+            summarized_input = data.strip()
+
+        conversation_input = summarized_input
+        input_summary_notice = ""
+        if input_was_summarized:
+            lines, chars = input_metrics
+            input_summary_notice = f"{USER_SUMMARY_NOTICE} (original {lines} lines / {chars} chars)"
+            print(input_summary_notice)
+            if summarized_input:
+                conversation_input = f"{input_summary_notice}\n{summarized_input}"
+            else:
+                conversation_input = input_summary_notice
+
         final_text = ""
         if mode == "stream":
             print("LLM (thinking): ", end="", flush=True)
-            final_text = provider.stream(system_prompt, user_prompt, data, temperature)
+            final_text = provider.stream(system_prompt, user_prompt, conversation_input, temperature)
         else:
-            response_text, final_text = provider.batch(system_prompt, user_prompt, data, temperature)
+            response_text, final_text = provider.batch(system_prompt, user_prompt, conversation_input, temperature)
             print(response_text)
 
         final_text, tool_history_entries = handle_tool_requests(final_text, None)
 
         if chat_after_stdin:
             memory_seed: List[str] = []
-            data_text = data.strip()
-            if data_text:
-                memory_seed.append(f"User: {data_text}")
+            if conversation_input:
+                memory_seed.append(f"User: {conversation_input.strip()}")
             if final_text:
                 memory_seed.append(f"Assistant: {final_text.strip()}")
             for entry in tool_history_entries:
