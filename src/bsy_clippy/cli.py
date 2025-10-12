@@ -44,6 +44,44 @@ MIN_SUMMARY_CHUNK_SIZE = 512
 SUMMARY_SEPARATOR = "\n---\n"
 SUMMARY_NOTICE = "[Tool output summarized]"
 MAX_SUMMARY_ITERATIONS = 6
+HELPER_COMMAND_PREFIXES = {"sudo", "doas", "env"}
+DANGEROUS_PRIMARY_COMMANDS = {
+    "rm",
+    "rmdir",
+    "unlink",
+    "del",
+    "erase",
+    "dd",
+    "shred",
+    "srm",
+    "wipefs",
+    "mkfs",
+    "mkfs.ext4",
+    "mkfs.ext3",
+    "mkfs.ntfs",
+    "mkfs.fat",
+    "mkfs.vfat",
+    "mkdosfs",
+    "diskutil",
+    "format",
+    "rd",
+}
+DANGEROUS_FLAGS = {
+    "-rf",
+    "-fr",
+    "-delete",
+    "--delete",
+    "--no-preserve-root",
+}
+DANGEROUS_PHRASES = (
+    "rm -rf",
+    "rm -fr",
+    "rm -r ",
+    "rm -f ",
+    "git clean",
+    "git reset --hard",
+    "xargs rm",
+)
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -261,6 +299,65 @@ def summarize_tool_output(text: str) -> Tuple[str, bool, Tuple[int, int]]:
     summary, truncated = _summarize_iteratively(snippet, TOOL_OUTPUT_SUMMARY_CHAR_LIMIT)
     line_count = snippet.count("\n") + 1
     return summary, truncated, (line_count, len(snippet))
+
+
+def _is_command_safe(cmd: str, parms: Sequence[str]) -> Tuple[bool, Optional[str]]:
+    tokens = [str(cmd)] + [str(item) for item in parms]
+    cleaned: List[Tuple[str, str, str]] = []
+    for token in tokens:
+        token_str = token.strip()
+        if not token_str:
+            continue
+        lowered = token_str.lower()
+        base = os.path.basename(lowered)
+        cleaned.append((token_str, lowered, base))
+
+    if not cleaned:
+        return False, "no command provided"
+
+    primary_index = 0
+    for idx, (_, lowered, base) in enumerate(cleaned):
+        if base in HELPER_COMMAND_PREFIXES:
+            continue
+        primary_index = idx
+        break
+
+    primary_lower = cleaned[primary_index][1]
+    primary_base = cleaned[primary_index][2]
+
+    if primary_base in DANGEROUS_PRIMARY_COMMANDS:
+        return False, f"command '{primary_base}' is blocked"
+
+    for idx, (_, lowered, base) in enumerate(cleaned):
+        if idx != primary_index and base in DANGEROUS_PRIMARY_COMMANDS:
+            return False, f"sub-command '{base}' is blocked"
+        if lowered in DANGEROUS_FLAGS:
+            return False, f"flag '{lowered}' is blocked"
+
+    if primary_base == "git":
+        subcommand = ""
+        if primary_index + 1 < len(cleaned):
+            subcommand = cleaned[primary_index + 1][2]
+        if subcommand in {"rm", "clean"}:
+            return False, f"'git {subcommand}' operations are blocked"
+        if subcommand == "reset":
+            forbidden = {"--hard", "--merge", "--keep", "--mixed", "--soft"}
+            for _, lowered, _ in cleaned[primary_index + 2 :]:
+                if lowered in forbidden:
+                    return False, "dangerous git reset option is blocked"
+
+    for idx, (_, lowered, base) in enumerate(cleaned):
+        if idx == primary_index:
+            continue
+        if base in {"rm", "rmdir", "unlink", "del"}:
+            return False, f"sub-command '{base}' is blocked"
+
+    combined = " ".join(lowered for _, lowered, _ in cleaned)
+    for phrase in DANGEROUS_PHRASES:
+        if phrase in combined:
+            return False, f"pattern '{phrase}' is blocked"
+
+    return True, None
 
 
 def print_stream_chunk(text: str, in_think: bool) -> Tuple[bool, str]:
@@ -755,6 +852,20 @@ def handle_tool_requests(raw_text: str, input_stream: Optional[IO[str]]) -> Tupl
         command_display = shlex.join([cmd, *parms])
 
         print(f"\n[Tool Request] {command_display}")
+        is_safe, unsafe_reason = _is_command_safe(cmd, parms)
+        if not is_safe:
+            warning = "[Tool] Command blocked."
+            if unsafe_reason:
+                warning = f"[Tool] Command blocked: {unsafe_reason}"
+            print(warning)
+            note = f"[Command blocked: {command_display}]"
+            if unsafe_reason:
+                note = f"{note} {unsafe_reason}"
+            appended_chunks.append(note.strip())
+            history_reason = f"{unsafe_reason}" if unsafe_reason else "unsafe command detected"
+            history_entries.append(f"Tool: {command_display} blocked ({history_reason})")
+            continue
+
         if not _prompt_yes_no("Execute command? [y/N]: ", input_stream):
             print("[Tool] Command skipped.")
             appended_chunks.append(f"[Command skipped: {command_display}]")
