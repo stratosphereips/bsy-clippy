@@ -792,6 +792,10 @@ def _extract_tool_requests(raw_text: str) -> Tuple[str, List[Dict[str, object]]]
 
 
 def _prompt_yes_no(prompt_text: str, input_stream: Optional[IO[str]]) -> bool:
+    if input_stream is None and not sys.stdin.isatty():
+        print("[Tool] No interactive input available; skipping command.")
+        return False
+
     current_prompt = prompt_text
     while True:
         try:
@@ -1279,6 +1283,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             return
 
+        confirmation_stream: Optional[IO[str]] = None
+        confirmation_close = False
+        if sys.stdin.isatty():
+            confirmation_stream = None
+        else:
+            tty_paths = ["CONIN$"] if os.name == "nt" else ["/dev/tty"]
+            for path in tty_paths:
+                try:
+                    confirmation_stream = open(path, "r", encoding="utf-8", errors="ignore")
+                    confirmation_close = True
+                    break
+                except OSError:
+                    continue
+
         summarized_input, input_was_summarized, input_metrics = summarize_user_input(data)
         if not summarized_input:
             summarized_input = data.strip()
@@ -1302,7 +1320,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             response_text, final_text = provider.batch(system_prompt, user_prompt, conversation_input, temperature)
             print(response_text)
 
-        final_text, tool_history_entries = handle_tool_requests(final_text, None)
+        try:
+            final_text, tool_history_entries = handle_tool_requests(final_text, confirmation_stream)
+        finally:
+            if confirmation_close and confirmation_stream not in {None, sys.stdin}:
+                try:
+                    confirmation_stream.close()
+                except OSError:
+                    pass
 
         if chat_after_stdin:
             memory_seed: List[str] = []
