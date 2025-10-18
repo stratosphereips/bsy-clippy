@@ -263,27 +263,24 @@ def create_openai_client(base_url: str) -> OpenAI:
     """Create an OpenAI client using environment credentials."""
     api_key = os.getenv("OPENAI_API_KEY")
     
-    # Check if this is a local/non-OpenAI endpoint that doesn't need a real key
-    is_local_endpoint = any([
+    # Check if this is a localhost endpoint that doesn't require a key
+    is_localhost = any([
         "localhost" in base_url.lower(),
         "127.0.0.1" in base_url,
         "0.0.0.0" in base_url,
-        "192.168." in base_url,  # Common local network
-        "10." in base_url,       # Private network
-        "172." in base_url,      # Private network (like your 172.20.0.100)
-    ]) or "openai.com" not in base_url.lower()
+    ])
     
     if not api_key:
-        if not is_local_endpoint and "openai.com" in base_url.lower():
-            # Only require real key for actual OpenAI API
+        if is_localhost:
+            # Localhost doesn't require a key, use dummy value
+            api_key = "dummy-key-for-localhost"
+        else:
+            # All other endpoints require a real API key
             print(
                 "[Error] OPENAI_API_KEY is not set. Create a .env file with OPENAI_API_KEY=<token> or export it.",
                 file=sys.stderr,
             )
             sys.exit(1)
-        else:
-            # Use a dummy key for local/compatible endpoints
-            api_key = "dummy-key-for-local-endpoint"
     
     try:
         return OpenAI(api_key=api_key, base_url=base_url)
