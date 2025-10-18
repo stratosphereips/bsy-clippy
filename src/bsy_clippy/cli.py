@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from importlib import resources
 from pathlib import Path
@@ -261,12 +262,29 @@ def resolve_base_url(
 def create_openai_client(base_url: str) -> OpenAI:
     """Create an OpenAI client using environment credentials."""
     api_key = os.getenv("OPENAI_API_KEY")
+    
+    # Check if this is a local/non-OpenAI endpoint that doesn't need a real key
+    is_local_endpoint = any([
+        "localhost" in base_url.lower(),
+        "127.0.0.1" in base_url,
+        "0.0.0.0" in base_url,
+        "192.168." in base_url,  # Common local network
+        "10." in base_url,       # Private network
+        "172." in base_url,      # Private network (like your 172.20.0.100)
+    ]) or "openai.com" not in base_url.lower()
+    
     if not api_key:
-        print(
-            "[Error] OPENAI_API_KEY is not set. Create a .env file with OPENAI_API_KEY=<token> or export it.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if not is_local_endpoint and "openai.com" in base_url.lower():
+            # Only require real key for actual OpenAI API
+            print(
+                "[Error] OPENAI_API_KEY is not set. Create a .env file with OPENAI_API_KEY=<token> or export it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        else:
+            # Use a dummy key for local/compatible endpoints
+            api_key = "dummy-key-for-local-endpoint"
+    
     try:
         return OpenAI(api_key=api_key, base_url=base_url)
     except OpenAIError as exc:
@@ -389,6 +407,98 @@ def read_user_input(prompt_text: str, input_stream: Optional[IO[str]]) -> str:
     return line.rstrip("\r\n")
 
 
+# ===== RAG / Vector Database Functions =====
+
+class VectorIndex:
+    """Simple vector database for RAG using fastembed + hnswlib."""
+
+    def __init__(self, texts: List[str], chunk_size: int = 500):
+        """Initialize the vector index with text chunks."""
+        try:
+            from fastembed import TextEmbedding
+            import hnswlib
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError(
+                "Vector database requires: fastembed, hnswlib, numpy. "
+                "Install with: pip install fastembed hnswlib numpy"
+            ) from exc
+
+        self.texts = texts
+        self.embed = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        
+        # Create embeddings
+        print(f"Creating vector embeddings for {len(texts)} chunks...", file=sys.stderr)
+        vecs = np.array(list(self.embed.embed(texts)), dtype=np.float32)
+        
+        # Build HNSW index
+        dim = vecs.shape[1]
+        self.index = hnswlib.Index(space="cosine", dim=dim)
+        self.index.init_index(max_elements=len(texts), ef_construction=200, M=16)
+        self.index.add_items(vecs, np.arange(len(texts)))
+        self.index.set_ef(64)
+        print(f"Vector index ready ({len(texts)} chunks, {dim} dimensions)", file=sys.stderr)
+
+    def retrieve(self, query: str, k: int = 4) -> List[str]:
+        """Retrieve top-k most relevant text chunks for the query."""
+        import numpy as np
+        
+        qv = np.array(list(self.embed.embed([query]))[0], dtype=np.float32)
+        labels, _ = self.index.knn_query(qv, k=min(k, len(self.texts)))
+        return [self.texts[i] for i in labels[0]]
+
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Split text into overlapping chunks for better context retrieval."""
+    if not text or not text.strip():
+        return []
+    
+    # Split by paragraphs first
+    paragraphs = re.split(r'\n\s*\n', text)
+    chunks = []
+    current_chunk = ""
+    
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+            
+        # If adding this paragraph exceeds chunk_size, save current chunk
+        if current_chunk and len(current_chunk) + len(para) > chunk_size:
+            chunks.append(current_chunk.strip())
+            # Start new chunk with overlap from end of previous
+            words = current_chunk.split()
+            overlap_text = " ".join(words[-overlap:]) if len(words) > overlap else current_chunk
+            current_chunk = overlap_text + "\n\n" + para
+        else:
+            if current_chunk:
+                current_chunk += "\n\n" + para
+            else:
+                current_chunk = para
+    
+    # Add final chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    # If we have very few chunks, fall back to simple character-based chunking
+    if len(chunks) < 3 and len(text) > chunk_size:
+        chunks = []
+        for i in range(0, len(text), chunk_size - overlap):
+            chunk = text[i:i + chunk_size]
+            if chunk.strip():
+                chunks.append(chunk.strip())
+    
+    return chunks
+
+
+def build_vector_index(text: str, chunk_size: int = 500) -> Optional[VectorIndex]:
+    """Build a vector index from input text."""
+    chunks = chunk_text(text, chunk_size=chunk_size)
+    if not chunks:
+        return None
+    return VectorIndex(chunks, chunk_size=chunk_size)
+
+
 def interactive_mode(
     client: OpenAI,
     base_url: str,
@@ -401,11 +511,15 @@ def interactive_mode(
     profile_name: Optional[str] = None,
     memory_seed: Optional[Sequence[str]] = None,
     input_stream: Optional[IO[str]] = None,
+    vector_index: Optional[VectorIndex] = None,
+    retrieve_chunks: int = 4,
 ) -> None:
     """Interactive chat mode with selectable output mode."""
     profile_info = f" (profile '{profile_name}')" if profile_name else ""
     print(f"Interactive mode with model '{model}' via {base_url}{profile_info}")
     print(f"Mode: {mode}, Temperature: {temperature}")
+    if vector_index:
+        print(f"RAG mode enabled: retrieving top {retrieve_chunks} relevant chunks per query")
     print("Type 'exit' or Ctrl+C to quit.")
     memory: List[str] = list(memory_seed) if memory_seed else []
     if memory_lines > 0 and memory:
@@ -446,15 +560,23 @@ def interactive_mode(
             user_text = prompt.strip()
             if user_text.lower() in {"exit", "quit"}:
                 break
+            
+            # Build context
             history_block = ""
             if memory:
                 history_block = "History of Past Interaction:\n" + "\n".join(memory)
+
+            # If vector index exists, retrieve relevant chunks
+            context_block = ""
+            if vector_index and user_text:
+                relevant_chunks = vector_index.retrieve(user_text, k=retrieve_chunks)
+                context_block = "Relevant Context:\n" + "\n\n---\n\n".join(relevant_chunks)
 
             current_block = ""
             if user_text:
                 current_block = f"Current User Message:\n{user_text}"
 
-            conversation_parts = [part for part in (history_block, current_block) if part]
+            conversation_parts = [part for part in (history_block, context_block, current_block) if part]
             conversation_input = "\n\n".join(conversation_parts)
             user_content = compose_prompt(user_prompt, conversation_input)
             messages = build_messages(system_prompt, user_content)
@@ -481,6 +603,91 @@ def interactive_mode(
                 local_stream.close()
             except OSError:
                 pass
+
+
+def handle_stdin_with_vector(
+    client: OpenAI,
+    base_url: str,
+    model: str,
+    mode: str,
+    temperature: float,
+    system_prompt: str,
+    user_prompt: str,
+    memory_lines: int,
+    active_profile: Optional[str],
+    data: str,
+    chunk_size: int,
+    retrieve_chunks: int,
+) -> None:
+    """Handle stdin input with vector database enabled."""
+    vector_index = build_vector_index(data, chunk_size=chunk_size)
+    if vector_index is None:
+        print("Warning: Failed to build vector index, falling back to normal mode", file=sys.stderr)
+        handle_stdin_without_vector(
+            client, base_url, model, mode, temperature,
+            system_prompt, user_prompt, memory_lines, active_profile, data, chat_after_stdin=False
+        )
+        return
+    
+    memory_seed: List[str] = []
+    print(f"Vector database ready with {len(vector_index.texts)} chunks", file=sys.stderr)
+    print("You can now ask questions about the input data.", file=sys.stderr)
+    
+    interactive_mode(
+        client, base_url, model, mode, temperature,
+        system_prompt, user_prompt, memory_lines, active_profile,
+        memory_seed if memory_seed else None,
+        vector_index=vector_index,
+        retrieve_chunks=retrieve_chunks,
+    )
+
+
+def handle_stdin_without_vector(
+    client: OpenAI,
+    base_url: str,
+    model: str,
+    mode: str,
+    temperature: float,
+    system_prompt: str,
+    user_prompt: str,
+    memory_lines: int,
+    active_profile: Optional[str],
+    data: str,
+    chat_after_stdin: bool = False,
+) -> None:
+    """Handle stdin input without vector database (normal mode)."""
+    user_content = compose_prompt(user_prompt, data)
+    messages = build_messages(system_prompt, user_content)
+
+    if not messages:
+        interactive_mode(
+            client, base_url, model, mode, temperature,
+            system_prompt, user_prompt, memory_lines, active_profile,
+        )
+        return
+
+    memory_seed: List[str] = []
+    data_text = data.strip()
+    if data_text:
+        memory_seed.append(f"User: {data_text}")
+
+    final_text = ""
+    if mode == "stream":
+        final_text = call_openai_stream(client, model, messages, temperature)
+    else:
+        response_text, final_text = call_openai_batch(client, model, messages, temperature)
+        print(response_text)
+    
+    if chat_after_stdin:
+        if final_text:
+            memory_seed.append(f"Assistant: {final_text.strip()}")
+        if memory_lines > 0 and memory_seed:
+            memory_seed = memory_seed[-memory_lines:]
+        interactive_mode(
+            client, base_url, model, mode, temperature,
+            system_prompt, user_prompt, memory_lines, active_profile,
+            memory_seed if memory_seed else None,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -565,6 +772,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the packaged default system prompt",
     )
+    parser.add_argument(
+        "--vector",
+        action="store_true",
+        help="Enable RAG mode: use vector database for large stdin inputs",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=500,
+        help="Chunk size for vector database (default: 500 characters)",
+    )
+    parser.add_argument(
+        "--retrieve-chunks",
+        type=int,
+        default=4,
+        help="Number of chunks to retrieve from vector database (default: 4)",
+    )
     return parser
 
 
@@ -585,81 +809,43 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         base_url = args.base_url
     model = args.model or profile_settings.get("model") or _DEFAULT_MODEL
 
+    # Load prompts and settings
     allow_default = not args.no_default_system
     system_prompt = load_system_prompt(args.system_file, allow_default=allow_default)
     user_prompt = args.user_prompt
     memory_lines = max(0, args.memory_lines)
-    chat_after_stdin = args.chat_after_stdin
     temperature = args.temperature
 
-    client = create_openai_client(base_url)
-
+    # Determine output mode
     mode = args.mode
     if mode is None:
-        if not sys.stdin.isatty():
-            mode = "batch"
-        else:
-            mode = "stream"
+        mode = "batch" if not sys.stdin.isatty() else "stream"
 
+    # Create OpenAI client
+    client = create_openai_client(base_url)
+
+    # Handle stdin input
     if not sys.stdin.isatty():
         data = sys.stdin.read()
-        user_content = compose_prompt(user_prompt, data)
-        messages = build_messages(system_prompt, user_content)
-
-        if not messages:
-            interactive_mode(
-                client,
-                base_url,
-                model,
-                mode,
-                temperature,
-                system_prompt,
-                user_prompt,
-                memory_lines,
-                active_profile,
+        
+        if args.vector and data.strip():
+            handle_stdin_with_vector(
+                client, base_url, model, mode, temperature,
+                system_prompt, user_prompt, memory_lines, active_profile,
+                data, args.chunk_size, args.retrieve_chunks,
             )
-            return
-
-        memory_seed: List[str] = []
-        data_text = data.strip()
-        if data_text:
-            memory_seed.append(f"User: {data_text}")
-
-        final_text = ""
-        if mode == "stream":
-            final_text = call_openai_stream(client, model, messages, temperature)
         else:
-            response_text, final_text = call_openai_batch(client, model, messages, temperature)
-            print(response_text)
-        if chat_after_stdin:
-            if final_text:
-                memory_seed.append(f"Assistant: {final_text.strip()}")
-            if memory_lines > 0 and memory_seed:
-                memory_seed = memory_seed[-memory_lines:]
-            interactive_mode(
-                client,
-                base_url,
-                model,
-                mode,
-                temperature,
-                system_prompt,
-                user_prompt,
-                memory_lines,
-                active_profile,
-                memory_seed if memory_seed else None,
+            handle_stdin_without_vector(
+                client, base_url, model, mode, temperature,
+                system_prompt, user_prompt, memory_lines, active_profile,
+                data, args.chat_after_stdin,
             )
         return
 
+    # No stdin: go directly to interactive mode
     interactive_mode(
-        client,
-        base_url,
-        model,
-        mode,
-        temperature,
-        system_prompt,
-        user_prompt,
-        memory_lines,
-        active_profile,
+        client, base_url, model, mode, temperature,
+        system_prompt, user_prompt, memory_lines, active_profile,
     )
 
 
