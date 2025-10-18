@@ -205,6 +205,64 @@ bsy-clippy --base-url http://127.0.0.1:11434/v1 --model llama2
 
 ---
 
+### Vector Database (RAG Mode)
+
+When processing large files that exceed the LLM's context window, use `--vector` to enable RAG (Retrieval-Augmented Generation):
+
+```bash
+cat large_document.txt | bsy-clippy --vector
+```
+
+This mode:
+1. Splits the input into semantic chunks (default: 500 chars with overlap)
+2. Creates vector embeddings using a fast CPU-based model
+3. Builds an HNSW index for efficient similarity search
+4. Enters interactive mode where each question retrieves only relevant chunks
+
+**Example workflow:**
+
+```bash
+# Process a large log file
+cat server_logs.txt | bsy-clippy --vector --retrieve-chunks 6
+
+# Interactive session starts
+You: What errors occurred between 10am and 11am?
+# LLM receives only the 6 most relevant log chunks
+
+You: Show me database connection issues
+# LLM receives different relevant chunks automatically
+```
+
+**Customize chunking:**
+
+```bash
+# Smaller chunks for dense technical content
+cat api_docs.txt | bsy-clippy --vector --chunk-size 300
+
+# Larger chunks for narrative content  
+cat book.txt | bsy-clippy --vector --chunk-size 800 --retrieve-chunks 3
+```
+
+**Benefits:**
+- Handle documents larger than LLM context window
+- Faster responses (fewer tokens processed)
+- More accurate answers (focused context)
+- Runs on CPU (no GPU needed)
+
+**Testing:**
+
+```bash
+# Run automated tests
+python test_vector_full.py
+
+# Test with sample data
+cat test_data.txt | bsy-clippy --vector --profile localollama
+```
+
+**Note:** On first use, the embedding model (~66MB) will be downloaded from HuggingFace. Local endpoints (localhost, 127.0.0.1, 192.168.x.x, 172.x.x.x, 10.x.x.x) don't require an API key.
+
+---
+
 ## Requirements
 
 See [`requirements.txt`](requirements.txt).
