@@ -5,6 +5,8 @@ import argparse
 import os
 import re
 import sys
+import threading
+import time
 from importlib import resources
 from pathlib import Path
 from typing import IO, Dict, List, Optional, Sequence, Tuple, Union
@@ -129,7 +131,41 @@ def colorize_response(text: str) -> str:
     return "".join(output)
 
 
-def print_stream_chunk(text: str, in_think: bool) -> Tuple[bool, str]:
+class Spinner:
+    """A simple spinning wheel indicator for hiding thinking output."""
+    
+    def __init__(self, message: str = "Thinking"):
+        self.message = message
+        self.spinning = False
+        self.thread = None
+        self.frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        self.frame_idx = 0
+        
+    def _spin(self):
+        """Internal method to display the spinner."""
+        while self.spinning:
+            frame = self.frames[self.frame_idx % len(self.frames)]
+            print(f"\r{YELLOW}{frame} {self.message}...{RESET}", end="", flush=True)
+            self.frame_idx += 1
+            time.sleep(0.1)
+    
+    def start(self):
+        """Start the spinner in a background thread."""
+        if not self.spinning:
+            self.spinning = True
+            self.thread = threading.Thread(target=self._spin, daemon=True)
+            self.thread.start()
+    
+    def stop(self):
+        """Stop the spinner and clear the line."""
+        if self.spinning:
+            self.spinning = False
+            if self.thread:
+                self.thread.join(timeout=0.5)
+            print("\r" + " " * (len(self.message) + 10) + "\r", end="", flush=True)
+
+
+def print_stream_chunk(text: str, in_think: bool, hide_thinking: bool = False, spinner: Optional[Spinner] = None) -> Tuple[bool, str]:
     """Stream a chunk of text with think/final color separation."""
     idx = 0
     final_parts: List[str] = []
@@ -138,14 +174,17 @@ def print_stream_chunk(text: str, in_think: bool) -> Tuple[bool, str]:
             close_idx = text.find("</think>", idx)
             if close_idx == -1:
                 segment = text[idx:]
-                if segment:
+                if segment and not hide_thinking:
                     print(f"{YELLOW}{segment}{RESET}", end="", flush=True)
                 idx = len(text)
             else:
                 segment = text[idx:close_idx]
-                if segment:
+                if segment and not hide_thinking:
                     print(f"{YELLOW}{segment}{RESET}", end="", flush=True)
-                print(f"{YELLOW}</think>{RESET}", end="", flush=True)
+                if not hide_thinking:
+                    print(f"{YELLOW}</think>{RESET}", end="", flush=True)
+                elif spinner:
+                    spinner.stop()
                 idx = close_idx + len("</think>")
                 in_think = False
         else:
@@ -161,7 +200,10 @@ def print_stream_chunk(text: str, in_think: bool) -> Tuple[bool, str]:
                 if segment:
                     print(f"{ANSWER_COLOR}{segment}{RESET}", end="", flush=True)
                     final_parts.append(segment)
-                print(f"{YELLOW}<think>{RESET}", end="", flush=True)
+                if not hide_thinking:
+                    print(f"{YELLOW}<think>{RESET}", end="", flush=True)
+                elif spinner:
+                    spinner.start()
                 idx = open_idx + len("<think>")
                 in_think = True
     return in_think, "".join(final_parts)
@@ -326,6 +368,7 @@ def call_openai_batch(
     model: str,
     messages: List[Dict[str, str]],
     temperature: float,
+    hide_thinking: bool = False,
 ) -> Tuple[str, str]:
     """Send a prompt to the OpenAI API and return the formatted and raw text."""
     try:
@@ -346,7 +389,13 @@ def call_openai_batch(
     content = ""
     if message is not None:
         content = _extract_content(getattr(message, "content", None))
-    return colorize_response(content), strip_think_segments(content)
+    
+    # If hiding thinking, strip it out entirely; otherwise colorize it
+    if hide_thinking:
+        clean_content = strip_think_segments(content)
+        return f"{ANSWER_COLOR}{clean_content}{RESET}", clean_content
+    else:
+        return colorize_response(content), strip_think_segments(content)
 
 
 def call_openai_stream(
@@ -354,6 +403,7 @@ def call_openai_stream(
     model: str,
     messages: List[Dict[str, str]],
     temperature: float,
+    hide_thinking: bool = False,
 ) -> str:
     """Send a prompt to the OpenAI API and stream response with color separation."""
     try:
@@ -369,6 +419,8 @@ def call_openai_stream(
 
     in_think = False
     final_parts: List[str] = []
+    spinner = Spinner("Thinking") if hide_thinking else None
+    
     try:
         for chunk in stream:
             for choice in getattr(chunk, "choices", []) or []:
@@ -377,12 +429,19 @@ def call_openai_stream(
                     continue
                 piece = _extract_content(getattr(delta, "content", None))
                 if piece:
-                    in_think, segment = print_stream_chunk(piece, in_think)
+                    in_think, segment = print_stream_chunk(piece, in_think, hide_thinking, spinner)
                     if segment:
                         final_parts.append(segment)
+        
+        # Make sure spinner is stopped
+        if spinner:
+            spinner.stop()
+        
         print()
     finally:
-        # Ensure the generator is closed to free resources
+        # Ensure spinner is stopped and generator is closed
+        if spinner:
+            spinner.stop()
         try:
             stream.close()  # type: ignore[attr-defined]
         except Exception:
@@ -509,6 +568,7 @@ def interactive_mode(
     input_stream: Optional[IO[str]] = None,
     vector_index: Optional[VectorIndex] = None,
     retrieve_chunks: int = 4,
+    hide_thinking: bool = False,
 ) -> None:
     """Interactive chat mode with selectable output mode."""
     profile_info = f" (profile '{profile_name}')" if profile_name else ""
@@ -580,10 +640,11 @@ def interactive_mode(
                 continue
             final_text = ""
             if mode == "stream":
-                print("LLM (thinking): ", end="", flush=True)
-                final_text = call_openai_stream(client, model, messages, temperature)
+                if not hide_thinking:
+                    print("LLM (thinking): ", end="", flush=True)
+                final_text = call_openai_stream(client, model, messages, temperature, hide_thinking)
             else:
-                response_text, final_text = call_openai_batch(client, model, messages, temperature)
+                response_text, final_text = call_openai_batch(client, model, messages, temperature, hide_thinking)
                 print(response_text)
 
             if memory_lines > 0:
@@ -614,6 +675,8 @@ def handle_stdin_with_vector(
     data: str,
     chunk_size: int,
     retrieve_chunks: int,
+    chat_after_stdin: bool = False,
+    hide_thinking: bool = False,
 ) -> None:
     """Handle stdin input with vector database enabled."""
     vector_index = build_vector_index(data, chunk_size=chunk_size)
@@ -625,17 +688,48 @@ def handle_stdin_with_vector(
         )
         return
     
-    memory_seed: List[str] = []
     print(f"Vector database ready with {len(vector_index.texts)} chunks", file=sys.stderr)
-    print("You can now ask questions about the input data.", file=sys.stderr)
     
-    interactive_mode(
-        client, base_url, model, mode, temperature,
-        system_prompt, user_prompt, memory_lines, active_profile,
-        memory_seed if memory_seed else None,
-        vector_index=vector_index,
-        retrieve_chunks=retrieve_chunks,
-    )
+    # If user_prompt is provided, process it first with RAG
+    memory_seed: List[str] = []
+    if user_prompt and user_prompt.strip():
+        # Retrieve relevant chunks
+        relevant_chunks = vector_index.retrieve(user_prompt, k=retrieve_chunks)
+        context_block = "Relevant Context:\n" + "\n\n---\n\n".join(relevant_chunks)
+        
+        # Build the full user content
+        user_content = compose_prompt(user_prompt, context_block)
+        messages = build_messages(system_prompt, user_content)
+        
+        if messages:
+            # Add to memory for potential chat continuation
+            if user_prompt.strip():
+                memory_seed.append(f"User: {user_prompt.strip()}")
+            
+            # Get the response
+            final_text = ""
+            if mode == "stream":
+                final_text = call_openai_stream(client, model, messages, temperature, hide_thinking)
+            else:
+                response_text, final_text = call_openai_batch(client, model, messages, temperature, hide_thinking)
+                print(response_text)
+            
+            if final_text:
+                memory_seed.append(f"Assistant: {final_text.strip()}")
+    
+    # Continue to interactive mode if requested
+    if chat_after_stdin:
+        print("You can now ask questions about the input data.", file=sys.stderr)
+        if memory_lines > 0 and memory_seed:
+            memory_seed = memory_seed[-memory_lines:]
+        interactive_mode(
+            client, base_url, model, mode, temperature,
+            system_prompt, user_prompt, memory_lines, active_profile,
+            memory_seed if memory_seed else None,
+            vector_index=vector_index,
+            retrieve_chunks=retrieve_chunks,
+            hide_thinking=hide_thinking,
+        )
 
 
 def handle_stdin_without_vector(
@@ -650,6 +744,7 @@ def handle_stdin_without_vector(
     active_profile: Optional[str],
     data: str,
     chat_after_stdin: bool = False,
+    hide_thinking: bool = False,
 ) -> None:
     """Handle stdin input without vector database (normal mode)."""
     user_content = compose_prompt(user_prompt, data)
@@ -659,6 +754,7 @@ def handle_stdin_without_vector(
         interactive_mode(
             client, base_url, model, mode, temperature,
             system_prompt, user_prompt, memory_lines, active_profile,
+            hide_thinking=hide_thinking,
         )
         return
 
@@ -669,9 +765,9 @@ def handle_stdin_without_vector(
 
     final_text = ""
     if mode == "stream":
-        final_text = call_openai_stream(client, model, messages, temperature)
+        final_text = call_openai_stream(client, model, messages, temperature, hide_thinking)
     else:
-        response_text, final_text = call_openai_batch(client, model, messages, temperature)
+        response_text, final_text = call_openai_batch(client, model, messages, temperature, hide_thinking)
         print(response_text)
     
     if chat_after_stdin:
@@ -683,6 +779,7 @@ def handle_stdin_without_vector(
             client, base_url, model, mode, temperature,
             system_prompt, user_prompt, memory_lines, active_profile,
             memory_seed if memory_seed else None,
+            hide_thinking=hide_thinking,
         )
 
 
@@ -785,6 +882,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Number of chunks to retrieve from vector database (default: 4)",
     )
+    parser.add_argument(
+        "--hide-thinking",
+        action="store_true",
+        help="Hide <think> sections and show spinning wheel instead",
+    )
     return parser
 
 
@@ -828,13 +930,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             handle_stdin_with_vector(
                 client, base_url, model, mode, temperature,
                 system_prompt, user_prompt, memory_lines, active_profile,
-                data, args.chunk_size, args.retrieve_chunks,
+                data, args.chunk_size, args.retrieve_chunks, args.chat_after_stdin,
+                args.hide_thinking,
             )
         else:
             handle_stdin_without_vector(
                 client, base_url, model, mode, temperature,
                 system_prompt, user_prompt, memory_lines, active_profile,
-                data, args.chat_after_stdin,
+                data, args.chat_after_stdin, args.hide_thinking,
             )
         return
 
@@ -842,6 +945,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     interactive_mode(
         client, base_url, model, mode, temperature,
         system_prompt, user_prompt, memory_lines, active_profile,
+        hide_thinking=args.hide_thinking,
     )
 
 
