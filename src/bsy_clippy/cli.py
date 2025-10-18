@@ -266,8 +266,7 @@ def create_openai_client(base_url: str) -> OpenAI:
     # Check if this is a localhost endpoint that doesn't require a key
     is_localhost = any([
         "localhost" in base_url.lower(),
-        "127.0.0.1" in base_url,
-        "0.0.0.0" in base_url,
+        "127.0.0.1" in base_url
     ])
     
     if not api_key:
