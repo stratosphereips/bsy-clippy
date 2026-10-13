@@ -24,7 +24,7 @@ You can also load **system prompts** from a file to guide the LLM’s behavior.
   - `-b` / `--base-url`, `-i` / `--ip`, `-p` / `--port` → override connection details per run
   - `-M` / `--model`, `-t` / `--temperature`, `-m` / `--mode` → tuning controls
   - `-s` / `--system-file`, `-u` / `--user-prompt` → additional prompting knobs
-  - `-r` / `--memory-lines`, `-c` / `--chat-after-stdin` → conversation persistence options
+  - `-r` / `--memory-lines`, `-c` / `--chat-after-stdin` → conversation persistence options (interactive mode remembers 12 entries by default)
 - Two modes of operation:
   - **Batch mode** → waits until the answer is complete, then prints only the final result.
   - **Stream mode** (default) → shows response in real-time, tokens appear as they are generated.
@@ -50,6 +50,12 @@ After updating the source, reinstall with `pipx reinstall bsy-clippy`.
 pip install .
 ```
 
+To install the latest code directly from GitHub after it is pushed:
+
+```bash
+pip install --upgrade git+https://github.com/stratosphereips/bsy-clippy.git@main
+```
+
 ---
 
 ## Configuration
@@ -60,9 +66,10 @@ Create a `.env` file next to where you run `bsy-clippy` and add your key:
 
 ```
 OPENAI_API_KEY=sk-...
+GROQ_API_KEY=gsk_...
 ```
 
-The CLI loads this automatically via `python-dotenv`; environment variables from your shell work too. Only the `openai` profile requires this token — `ollama` profiles can leave it unset.
+The CLI loads this automatically via `python-dotenv`; environment variables from your shell work too. The `openai` profile uses `OPENAI_API_KEY`, the `groq` profile uses `GROQ_API_KEY`, and `ollama` profiles need no API key. Keep `.env` out of version control.
 
 ### YAML defaults (`bsy-clippy.yaml`)
 
@@ -81,12 +88,25 @@ api:
     #   base_url: https://api.openai.com/v1
     #   model: gpt-4o-mini
     #   api_key_env: OPENAI_API_KEY
+    groq:
+      provider: openai
+      base_url: https://api.groq.com/openai/v1
+      model: openai/gpt-oss-120b
+      api_key_env: GROQ_API_KEY
+    cesnet:
+      provider: openai
+      base_url: https://chat.ai.e-infra.cz/api
+      #model: glm-5.3
+      model: mini
+      api_key_env: CESNET_API_KEY
 ```
 
 #### Switching profiles
 
-- Keep `profile: ollama` (the default) to talk to an Ollama server; no API token is required. Adjust `base_url` if your host or port differs.
+- Use `profile: ollama` to talk to an Ollama server; no API token is required. Adjust `base_url` if your host or port differs.
 - To use OpenAI, either set `profile: openai` in the file or pass `--profile openai` on the command line. Make sure the `OPENAI_API_KEY` environment variable (or the name set in `api_key_env`) is populated before running the command.
+- To use Groq, add `GROQ_API_KEY` to `.env` or your shell and select `--profile groq`. The repository config selects this profile by default.
+- For CESNET/e-INFRA CZ, set `CESNET_API_KEY` and select `--profile cesnet`. The CLI maps the configured `https://chat.ai.e-infra.cz/api` URL to the current API endpoint, `https://llm.ai.e-infra.cz/v1`.
 - You can define additional profiles (for example, staging clusters) under `api.profiles` and select them with `--profile <name>`.
 
 ### Quick check
@@ -110,7 +130,7 @@ python -c "import importlib.resources as r, pathlib; pathlib.Path('bsy-clippy.ya
 ### System prompt file
 
 By default, `bsy-clippy` loads a bundled prompt (`Be very brief. Be very short.`).  
-You can change this with `--system-file` or disable it via `--no-default-system`.
+You can change this with `--system-file` or disable it via `--no-default-system`. The CLI always adds its tool instructions so models know when and how to request a local command.
 
 Example **bsy-clippy.txt**:
 
@@ -135,8 +155,11 @@ data from stdin or interactive input
 
 ### Interactive memory
 
-Set `--memory-lines 6` (or `-r 6`) to keep the last six conversation lines (user + assistant) while chatting.  
-Only the final assistant reply (not the thinking traces) is stored and sent back on the next turn.
+Interactive mode remembers the last 12 conversation entries (user, assistant, and tool results) by default. Use `--memory-lines 6` (or `-r 6`) to keep six, or `-r 0` to disable memory. Only the final assistant reply and tool results are stored; thinking traces are not.
+
+### Local command tool
+
+When a request needs information from this machine, the model can request a command. The CLI displays it and asks `Execute command? [y/N]:` before running it. The command output is sent back to the model so it can answer in the same turn. A declined or blocked command is reported back as well. Up to three commands can run in one turn. Piped input without an interactive terminal cannot approve commands.
 
 ### Chat after stdin
 

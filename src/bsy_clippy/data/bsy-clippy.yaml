@@ -10,13 +10,18 @@ api:
        base_url: https://api.openai.com/v1
        model: gpt-4o-mini
        api_key_env: OPENAI_API_KEY
+    groq:
+      provider: openai
+      base_url: https://api.groq.com/openai/v1
+      model: openai/gpt-oss-120b
+      api_key_env: GROQ_API_KEY
     cesnet:
        provider: openai
        base_url: https://chat.ai.e-infra.cz/api
-       model: qwen3-coder
+       #model: glm-5.3
+       model: mini
        api_key_env: CESNET_API_KEY
     ctu:
       provider: ollama
       base_url: https://147.32.80.44:11434
       model: qwen3:1.7b
-
